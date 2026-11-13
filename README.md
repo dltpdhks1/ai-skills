@@ -8,10 +8,21 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 |---|---|---|
 | `frontend-design` | [anthropics/skills](https://github.com/anthropics/skills) | Apache License 2.0 |
 | Superpowers 스킬 15개 (아래 표) | [obra/superpowers](https://github.com/obra/superpowers) v7.0.2 | MIT |
+| `find-skills` | [vercel-labs/skills](https://github.com/vercel-labs/skills) ([skills.sh](https://www.skills.sh/vercel-labs/skills/find-skills)) | MIT |
 
 ### frontend-design
 
 새 UI를 만들거나 기존 UI를 다시 디자인할 때, 템플릿 같은 결과 대신 주제에 맞는 뚜렷한 디자인을 만들도록 Claude를 안내합니다. 방향 잡기, 서체·색·레이아웃·모션 선택, 흔한 AI 디자인 패턴 피하기, 계획 → 구현 → 자체 점검 순서, UI 문구 작성 원칙을 다룹니다.
+
+### find-skills
+
+"X는 어떻게 해?", "X용 스킬 있어?"처럼 묻거나 Claude가 할 수 있는 일을 넓히고 싶을 때, 공개 에이전트 스킬 생태계에서 맞는 스킬을 찾아 설치하도록 돕습니다. [skills.sh](https://skills.sh/) 순위표를 먼저 보고, `npx skills find <검색어>`로 찾은 뒤, 설치 수·출처·GitHub 스타로 품질을 확인하고 나서 `npx skills add <owner/repo@skill>` 설치 명령을 제안합니다. 맞는 스킬이 없으면 직접 돕거나 `npx skills init`으로 새 스킬을 만들도록 안내합니다.
+
+Node.js(`npx`)가 필요하며, 검색과 설치 시 skills.sh와 GitHub에 접속합니다.
+
+```
+PDF 다루는 스킬 있는지 찾아줘.
+```
 
 ### Superpowers
 
@@ -48,7 +59,7 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 로그인 기능을 만들고 싶어. brainstorming 스킬부터 시작해줘.
 ```
 
-`/brainstorming`, `/frontend-design`처럼 직접 호출할 수도 있습니다.
+`/brainstorming`, `/frontend-design`, `/find-skills`처럼 직접 호출할 수도 있습니다.
 
 ### 다른 프로젝트나 모든 프로젝트에서 사용
 
@@ -81,3 +92,4 @@ cp -r .claude/skills/* ~/.claude/skills/
 
 - `frontend-design`: Apache License 2.0
 - Superpowers 스킬: MIT License, Copyright (c) 2025 Jesse Vincent
+- `find-skills`: MIT License, Copyright (c) 2026 Vercel, Inc.
