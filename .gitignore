@@ -3,3 +3,6 @@ __pycache__/
 .idea/
 .vscode/
 
+
+# Impeccable engine binaries (downloaded on first run)
+.claude/skills/impeccable/scripts/bin/
