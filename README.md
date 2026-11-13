@@ -14,6 +14,8 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 
 새 UI를 만들거나 기존 UI를 다시 디자인할 때, 템플릿 같은 결과 대신 주제에 맞는 뚜렷한 디자인을 만들도록 Claude를 안내합니다. 방향 잡기, 서체·색·레이아웃·모션 선택, 흔한 AI 디자인 패턴 피하기, 계획 → 구현 → 자체 점검 순서, UI 문구 작성 원칙을 다룹니다.
 
+원본 설명(description)은 "새 UI를 만들거나 기존 UI를 다시 디자인할 때" 불리도록 되어 있습니다. 이 저장소에서는 impeccable과 겹치지 않도록 새 UI를 처음 만들 때로 좁히고, 기존 화면 작업은 impeccable을 쓰라는 문장을 덧붙였습니다. 본문은 원본 그대로입니다.
+
 ### Superpowers
 
 브레인스토밍 → 계획 → TDD 구현 → 리뷰 → 마무리로 이어지는 개발 흐름을 스킬로 묶은 모음입니다.
@@ -63,7 +65,7 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 
 #### frontend-design과의 차이
 
-frontend-design은 새 화면을 만들 때 방향을 잡아 주는 짧은 지침이고, impeccable은 기존 화면을 명령 단위로 검토·수정하는 데 강합니다. 다만 두 스킬 모두 "다시 디자인" 같은 요청에 불리도록 설명이 쓰여 있어, 이름 없이 요청하면 어느 쪽이 불릴지 정해져 있지 않습니다. 원하는 스킬이 있으면 `/impeccable …`, `/frontend-design`처럼 직접 호출하세요.
+frontend-design은 새 화면을 처음 만들 때 방향을 잡아 주는 짧은 지침이고, impeccable은 기존 화면을 명령 단위로 검토·수정하는 데 강합니다. 기존 화면을 다시 디자인하는 요청에는 impeccable이 불리도록 frontend-design의 설명을 좁혀 두었습니다. 새 화면을 만드는 요청은 impeccable의 설명에도 해당하므로 둘 중 어느 쪽이든 불릴 수 있습니다. 확실하게 고르려면 `/impeccable …`, `/frontend-design`처럼 직접 호출하세요.
 
 #### 원본과 다른 점
 
@@ -100,6 +102,20 @@ cp -r .claude/skills/* ~/.claude/skills/
 /plugin marketplace add obra/superpowers-marketplace
 /plugin install superpowers@superpowers-marketplace
 ```
+
+### Impeccable 업데이트
+
+원본은 자주 업데이트됩니다. 새 버전으로 바꿀 때는 폴더를 통째로 교체하고 라이선스 파일을 다시 넣습니다. 파일을 덮어쓰기만 하면 지워진 파일이 남으므로 먼저 폴더를 지우세요.
+
+```bash
+git clone --depth 1 https://github.com/pbakaus/impeccable.git /tmp/impeccable
+rm -rf .claude/skills/impeccable
+cp -r /tmp/impeccable/.claude/skills/impeccable .claude/skills/
+cp /tmp/impeccable/LICENSE .claude/skills/impeccable/LICENSE.txt
+cp /tmp/impeccable/NOTICE.md .claude/skills/impeccable/NOTICE.md
+```
+
+새 버전 번호는 `.claude/skills/impeccable/SKILL.md` 맨 위의 `version:`에 있습니다. 이 번호로 README의 스킬 표를 고치세요. 엔진 버전이 바뀌면 실행기가 다음 실행 때 새 바이너리를 내려받습니다.
 
 ### Impeccable을 원본 플러그인으로 설치
 

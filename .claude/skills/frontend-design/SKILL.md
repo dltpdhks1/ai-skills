@@ -1,6 +1,6 @@
 ---
 name: frontend-design
-description: Guidance for distinctive, intentional visual design when building new UI or reshaping an existing one. Helps with aesthetic direction, typography, and making choices that don't read as templated defaults.
+description: Guidance for distinctive, intentional visual design when building a new UI from scratch. Helps with aesthetic direction, typography, and making choices that don't read as templated defaults. To critique, audit, polish or redesign a UI that already exists, use the impeccable skill instead.
 license: Complete terms in LICENSE.txt
 ---
 
