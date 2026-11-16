@@ -10,6 +10,7 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 | Superpowers 스킬 15개 (아래 표) | [obra/superpowers](https://github.com/obra/superpowers) v7.0.2 | MIT |
 | `impeccable` | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) v4.9.0 | Apache License 2.0 |
 | `find-skills` | [vercel-labs/skills](https://github.com/vercel-labs/skills) ([skills.sh](https://www.skills.sh/vercel-labs/skills/find-skills)) | MIT |
+| `grilling`, `grill-me` | [mattpocock/skills](https://github.com/mattpocock/skills) | MIT |
 
 ### frontend-design
 
@@ -25,6 +26,21 @@ Node.js(`npx`)가 필요하며, 검색과 설치 시 skills.sh와 GitHub에 접�
 
 ```
 PDF 다루는 스킬 있는지 찾아줘.
+```
+
+### grilling / grill-me
+
+계획·설계·결정을 끝까지 파고드는 인터뷰 스킬입니다. 결정 사항을 가지가 있는 트리로 보고, 먼저 물을 수 있는 질문을 한 라운드에 번호를 붙여 묻습니다. 질문마다 권장 답을 붙이므로 "네"라고만 해도 수락됩니다. 확인 가능한 사실은 사용자에게 묻지 않고 서브에이전트가 찾습니다. 모든 가지를 확인하고 사용자가 공통 이해에 도달했다고 확인하면 끝납니다.
+
+| 스킬 | 역할 |
+|---|---|
+| `grilling` | 인터뷰 본체. "grill" 같은 표현이나 계획을 검증하고 싶다는 요청에 모델이 자동으로 부를 수 있음 |
+| `grill-me` | `grilling`을 부르는 얇은 래퍼. 모델이 자동으로 부르지 않고 `/grill-me`로 직접 호출할 때만 동작 |
+
+`grill-me`가 `grilling`을 호출하므로 두 폴더를 함께 두어야 합니다. 본문은 원본 그대로입니다.
+
+```
+/grill-me 이번 결제 모듈 리팩터링 계획
 ```
 
 ### Superpowers
@@ -149,3 +165,4 @@ cp /tmp/impeccable/NOTICE.md .claude/skills/impeccable/NOTICE.md
 - Superpowers 스킬: MIT License, Copyright (c) 2025 Jesse Vincent
 - `impeccable`: Apache License 2.0, Copyright Paul Bakaus. 일부 참고 문서(`ios.md`, `android.md`)의 출처는 폴더 안 `NOTICE.md`에 있습니다.
 - `find-skills`: MIT License, Copyright (c) 2026 Vercel, Inc.
+- `grilling`, `grill-me`: MIT License, Copyright (c) 2026 Matt Pocock
