@@ -11,6 +11,7 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 | `impeccable` | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) v4.9.0 | Apache License 2.0 |
 | `find-skills` | [vercel-labs/skills](https://github.com/vercel-labs/skills) ([skills.sh](https://www.skills.sh/vercel-labs/skills/find-skills)) | MIT |
 | `grilling`, `grill-me` | [mattpocock/skills](https://github.com/mattpocock/skills) | MIT |
+| `ffmpeg-skill` | [kajisho5/ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) v3.10.1 | MIT |
 
 ### frontend-design
 
@@ -42,6 +43,22 @@ PDF 다루는 스킬 있는지 찾아줘.
 ```
 /grill-me 이번 결제 모듈 리팩터링 계획
 ```
+
+### ffmpeg-skill
+
+내 컴퓨터의 FFmpeg로 영상·오디오를 편집하는 스킬입니다. 자르기·이어 붙이기·화면비 맞추기·속도 조절·자막·오버레이·무음 구간 제거·싱크 맞추기·음량(LUFS) 맞추기·HDR→SDR·플랫폼별 내보내기와 검사까지 42개 Python 스크립트(`scripts/`)로 처리합니다. mp4·mov·wav 같은 파일이나 자막, 릴스·쇼츠, 유튜브·틱톡 업로드, ffmpeg를 언급하면 불립니다. 먼저 `probe.py`로 파일을 확인하고, 작업 후 결과를 검사하는 순서로 진행합니다.
+
+FFmpeg 6.1 이상과 Python 3.10 이상이 필요합니다. 표준 라이브러리만 쓰고, 클라우드나 API 키는 필요 없습니다. 플랫폼 프리셋은 `templates/`(유튜브, 쇼츠, 릴스, 틱톡 등)에 있습니다.
+
+```
+interview.mp4에서 무음 구간 빼고 쇼츠용 세로 영상으로 만들어줘.
+```
+
+#### 원본과 다른 점
+
+- 원본의 `npx ffmpeg-skill` 설치기가 복사하는 파일(`SKILL.md`, `scripts/`, `templates/`, `mcp/`, `references/`의 배포 문서, `docs/contract.md`, `package.json`)만 넣었습니다. 데모 영상·개발용 문서·테스트는 빼서 원본 저장소(약 30 MB)보다 작습니다(약 3 MB). 본문은 원본 그대로입니다.
+- 라이선스 파일 이름을 다른 스킬과 맞춰 `LICENSE.txt`로 바꿨습니다.
+- MCP 서버(`mcp/server.py`)는 포함만 되어 있고 등록하지 않았습니다. 스킬은 스크립트를 직접 실행하는 방식으로 동작합니다.
 
 ### Superpowers
 
@@ -166,3 +183,4 @@ cp /tmp/impeccable/NOTICE.md .claude/skills/impeccable/NOTICE.md
 - `impeccable`: Apache License 2.0, Copyright Paul Bakaus. 일부 참고 문서(`ios.md`, `android.md`)의 출처는 폴더 안 `NOTICE.md`에 있습니다.
 - `find-skills`: MIT License, Copyright (c) 2026 Vercel, Inc.
 - `grilling`, `grill-me`: MIT License, Copyright (c) 2026 Matt Pocock
+- `ffmpeg-skill`: MIT License, Copyright (c) 2026 kajisho5
