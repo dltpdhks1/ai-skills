@@ -12,6 +12,7 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 | `find-skills` | [vercel-labs/skills](https://github.com/vercel-labs/skills) ([skills.sh](https://www.skills.sh/vercel-labs/skills/find-skills)) | MIT |
 | `grilling`, `grill-me` | [mattpocock/skills](https://github.com/mattpocock/skills) | MIT |
 | `ffmpeg-skill` | [kajisho5/ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) v3.10.1 | MIT |
+| `brand-style-slides` | 직접 작성 (디자인 데이터: [VoltAgent/awesome-design-md](https://github.com/VoltAgent/awesome-design-md)) | MIT (디자인 데이터) |
 
 ### frontend-design
 
@@ -59,6 +60,16 @@ interview.mp4에서 무음 구간 빼고 쇼츠용 세로 영상으로 만들어
 - 원본의 `npx ffmpeg-skill` 설치기가 복사하는 파일(`SKILL.md`, `scripts/`, `templates/`, `mcp/`, `references/`의 배포 문서, `docs/contract.md`, `package.json`)만 넣었습니다. 데모 영상·개발용 문서·테스트는 빼서 원본 저장소(약 30 MB)보다 작습니다(약 3 MB). 본문은 원본 그대로입니다.
 - 라이선스 파일 이름을 다른 스킬과 맞춰 `LICENSE.txt`로 바꿨습니다.
 - MCP 서버(`mcp/server.py`)는 포함만 되어 있고 등록하지 않았습니다. 스킬은 스크립트를 직접 실행하는 방식으로 동작합니다.
+
+### brand-style-slides
+
+"Stripe 느낌으로", "Apple 스타일로"처럼 브랜드 디자인을 골라 발표자료를 만드는 스킬입니다. 실행할 때 VoltAgent의 [awesome-design-md](https://github.com/VoltAgent/awesome-design-md)(MIT)에서 브랜드별 `DESIGN.md`를 내려받아, 색·글꼴·여백·분위기를 16:9 슬라이드 규칙(제목 28~40pt, 본문 14~18pt, 강조색은 장당 1~2곳)으로 바꿔 적용합니다. 디자인 분위기만 빌리고 해당 회사의 로고·이름·슬로건은 쓰지 않으며, 사내 보고서는 현황 → 문제 → 개선방안 → 기대효과 흐름을 기본으로 합니다.
+
+실행 시 `git clone`으로 GitHub에 접속하므로 네트워크가 필요하고, 디자인 데이터는 저장소에 넣지 않았습니다.
+
+```
+/brand-style-slides Stripe 느낌으로 분기 실적 보고 슬라이드 만들어줘
+```
 
 ### Superpowers
 
@@ -184,3 +195,4 @@ cp /tmp/impeccable/NOTICE.md .claude/skills/impeccable/NOTICE.md
 - `find-skills`: MIT License, Copyright (c) 2026 Vercel, Inc.
 - `grilling`, `grill-me`: MIT License, Copyright (c) 2026 Matt Pocock
 - `ffmpeg-skill`: MIT License, Copyright (c) 2026 kajisho5
+- `brand-style-slides`: 스킬 본문은 이 저장소 소유자가 작성했습니다. 실행 시 내려받는 VoltAgent/awesome-design-md는 MIT 라이선스입니다.
