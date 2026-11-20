@@ -1,5 +1,13 @@
 # ai-skills
 
+## 자동 업데이트
+
+GitHub Actions가 원본을 매일 확인하고 변경사항을 main에 반영합니다. find-skills는 한국 시간 09:23, 나머지 원본 스킬은 10:17에 확인합니다. 실행 내역은 저장소의 Actions에서 확인할 수 있습니다.
+
+frontend-design의 호출 설명과 Superpowers의 프로젝트 스킬 참조는 유지합니다. 직접 만든 brand-style-slides는 그대로 관리하며, 디자인 자료는 실행 시 원본에서 가져옵니다. 자동 업데이트 대상 폴더를 직접 수정하면 다음 실행에서 덮어써질 수 있습니다.
+
+PC에 복사하거나 클론해 둔 파일에는 별도로 git pull 또는 복사가 필요합니다. 아래 기능 설명은 작성 시점의 안내이므로 상세 사용법은 각 스킬의 SKILL.md를 확인하세요.
+
 Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 클론해 Claude Code를 실행하면 `.claude/skills/` 아래의 스킬이 자동으로 로드됩니다.
 
 ## 포함된 스킬
@@ -7,11 +15,11 @@ Claude Code용 스킬을 모아 관리하는 저장소입니다. 저장소를 �
 | 스킬 | 출처 | 라이선스 |
 |---|---|---|
 | `frontend-design` | [anthropics/skills](https://github.com/anthropics/skills) | Apache License 2.0 |
-| Superpowers 스킬 15개 (아래 표) | [obra/superpowers](https://github.com/obra/superpowers) v7.0.2 | MIT |
-| `impeccable` | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) v4.9.0 | Apache License 2.0 |
+| Superpowers 스킬 15개 (아래 표) | [obra/superpowers](https://github.com/obra/superpowers) (자동 업데이트) | MIT |
+| `impeccable` | [pbakaus/impeccable](https://github.com/pbakaus/impeccable) (자동 업데이트) | Apache License 2.0 |
 | `find-skills` | [vercel-labs/skills](https://github.com/vercel-labs/skills) ([skills.sh](https://www.skills.sh/vercel-labs/skills/find-skills)) | MIT |
 | `grilling`, `grill-me` | [mattpocock/skills](https://github.com/mattpocock/skills) | MIT |
-| `ffmpeg-skill` | [kajisho5/ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) v3.10.1 | MIT |
+| `ffmpeg-skill` | [kajisho5/ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (자동 업데이트) | MIT |
 | `brand-style-slides` | 직접 작성 (디자인 데이터: [VoltAgent/awesome-design-md](https://github.com/VoltAgent/awesome-design-md)) | MIT (디자인 데이터) |
 
 ### frontend-design
