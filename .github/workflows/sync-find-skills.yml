@@ -1,0 +1,28 @@
+name: Sync find-skills
+on:
+  schedule:
+    - cron: '23 0 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sync-find-skills
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download upstream skill
+        run: |
+          curl --fail --location --silent --show-error https://raw.githubusercontent.com/vercel-labs/skills/main/skills/find-skills/SKILL.md -o /tmp/find-skills.md
+          test -s /tmp/find-skills.md
+          cp /tmp/find-skills.md .claude/skills/find-skills/SKILL.md
+      - name: Commit changes
+        run: |
+          git add .claude/skills/find-skills/SKILL.md
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Update find-skills from upstream'
+          git push
