@@ -52,6 +52,8 @@ jobs:
           paths = ['SKILL.md', 'scripts', 'templates', 'mcp', 'package.json']
           paths += [p for p in package['files'] if p.startswith(('references/', 'docs/')) and not p.endswith('/')]
           assert 'docs/contract.md' in paths
+          shutil.rmtree(target)
+          target.mkdir(parents=True)
           for path in paths:
               src, dst = source / path, target / path
               if src.is_dir():
