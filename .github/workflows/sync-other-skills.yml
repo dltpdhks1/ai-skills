@@ -1,0 +1,71 @@
+name: Sync other skills
+on:
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sync-other-skills
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download upstream repositories
+        run: |
+          git clone --depth 1 https://github.com/anthropics/skills.git /tmp/up-anthropic
+          git clone --depth 1 https://github.com/obra/superpowers.git /tmp/up-superpowers
+          git clone --depth 1 https://github.com/pbakaus/impeccable.git /tmp/up-impeccable
+          git clone --depth 1 https://github.com/mattpocock/skills.git /tmp/up-matt
+          git clone --depth 1 https://github.com/kajisho5/ffmpeg-skill.git /tmp/up-ffmpeg
+      - name: Update skills
+        run: |
+          set -euo pipefail
+          base=.claude/skills
+          cp /tmp/up-anthropic/skills/frontend-design/SKILL.md /tmp/frontend.md
+          python3 -c 'import pathlib,re; p=pathlib.Path(".claude/skills/frontend-design/SKILL.md"); old=p.read_text(); new=pathlib.Path("/tmp/frontend.md").read_text(); desc=re.search(r"(?m)^description:.*$",old).group(); new,n=re.subn(r"(?m)^description:.*$",lambda m:desc,new,count=1); assert n==1; p.write_text(new)'
+          cp /tmp/up-anthropic/skills/frontend-design/LICENSE.txt "$base/frontend-design/LICENSE.txt"
+          for source in /tmp/up-superpowers/skills/{brainstorming,diagnosing-superpowers,dispatching-parallel-agents,executing-plans,finishing-a-development-branch,receiving-code-review,requesting-code-review,subagent-driven-development,systematic-debugging,test-driven-development,using-git-worktrees,using-superpowers,verification-before-completion,writing-plans,writing-skills}; do
+            [ -f "$source/SKILL.md" ] || continue
+            name=$(basename "$source")
+            mkdir -p "$base/$name"
+            rsync -a --delete --exclude=LICENSE.txt "$source/" "$base/$name/"
+            find "$base/$name" -type f -name '*.md' -exec sed -i 's/superpowers://g' {} +
+            cp /tmp/up-superpowers/LICENSE "$base/$name/LICENSE.txt"
+          done
+          for name in grilling grill-me; do
+            source="/tmp/up-matt/skills/productivity/$name"
+            test -f "$source/SKILL.md"
+            rsync -a --delete --exclude=LICENSE.txt "$source/" "$base/$name/"
+            cp /tmp/up-matt/LICENSE "$base/$name/LICENSE.txt"
+          done
+          rsync -a --delete --exclude=LICENSE.txt --exclude=NOTICE.md /tmp/up-impeccable/.claude/skills/impeccable/ "$base/impeccable/"
+          cp /tmp/up-impeccable/LICENSE "$base/impeccable/LICENSE.txt"
+          cp /tmp/up-impeccable/NOTICE.md "$base/impeccable/NOTICE.md"
+          python3 - <<'PY'
+          import json, pathlib, shutil
+          source = pathlib.Path('/tmp/up-ffmpeg')
+          target = pathlib.Path('.claude/skills/ffmpeg-skill')
+          package = json.loads((source / 'package.json').read_text())
+          paths = ['SKILL.md', 'scripts', 'templates', 'mcp', 'package.json']
+          paths += [p for p in package['files'] if p.startswith(('references/', 'docs/')) and not p.endswith('/')]
+          assert 'docs/contract.md' in paths
+          for path in paths:
+              src, dst = source / path, target / path
+              if src.is_dir():
+                  shutil.copytree(src, dst, dirs_exist_ok=True)
+              else:
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(src, dst)
+          shutil.copy2(source / 'LICENSE', target / 'LICENSE.txt')
+          PY
+      - name: Commit updates
+        run: |
+          git add .claude/skills
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Update skills from upstream sources'
+          git push
