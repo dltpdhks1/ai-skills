@@ -61,12 +61,12 @@ def main() -> int:
     aim.add_argument("--pitch", type=float, default=0.0, help="up/down rotation in degrees, -180..180 (default 0, level)")
     aim.add_argument("--roll", type=float, default=0.0, help="tilt/roll rotation in degrees, -180..180 (default 0)")
     fov = ap.add_argument_group("field of view")
-    fov.add_argument("--h-fov", type=float, default=90.0, help="output horizontal field of view in degrees, 1..170 (default 90)")
+    fov.add_argument("--h-fov", "--fov", type=float, default=90.0, help="output horizontal field of view in degrees, 1..170 (default 90)")
     fov.add_argument("--v-fov", type=float, default=None,
                      help="output vertical field of view in degrees, 1..170 (default: the one that keeps pixels square at "
                           "--h-fov and --width/--height, 58.7 at the defaults)")
     out = ap.add_argument_group("output frame")
-    out.add_argument("--width", type=int, default=1920, help="output width in px, must be even (default 1920)")
+    out.add_argument("--width", type=int, default=1920, help="output width in px, must be even (default 1920); a size or resolution WxH is --width W --height H")
     out.add_argument("--height", type=int, default=1080, help="output height in px, must be even (default 1080)")
     out.add_argument("--interp", choices=INTERP_METHODS, default="lanczos", help="resampling method (default lanczos)")
     ap.set_defaults(crf=18)  # --quality's default (the --crf alias was removed in 2.0)
@@ -78,16 +78,7 @@ def main() -> int:
     if args.fps is not None and args.fps <= 0:
         die(f"--fps must be positive, got {args.fps:g}")
 
-    if not -180 <= args.yaw <= 180:
-        die(f"--yaw must be -180..180, got {args.yaw}")
-    if not -180 <= args.pitch <= 180:
-        die(f"--pitch must be -180..180, got {args.pitch}")
-    if not -180 <= args.roll <= 180:
-        die(f"--roll must be -180..180, got {args.roll}")
-    if not 1 <= args.h_fov <= 170:
-        die(f"--h-fov must be 1..170, got {args.h_fov}")
-    if args.v_fov is not None and not 1 <= args.v_fov <= 170:
-        die(f"--v-fov must be 1..170, got {args.v_fov}")
+    # the angles and both fields of view state their range in the help; apply_common refuses outside it
     if args.width <= 0 or args.height <= 0:
         die(f"--width/--height must be > 0, got width={args.width} height={args.height}")
     if args.width % 2 or args.height % 2:

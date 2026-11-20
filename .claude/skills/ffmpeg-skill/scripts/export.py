@@ -30,7 +30,7 @@ Presets:
 Examples:
   python3 export.py final.mp4 --preset youtube
   python3 export.py final.mp4 --preset reels --fit crop
-  python3 export.py final.mp4 --preset reels --normalize   # meet the platform's loudness in the same call
+  python3 export.py final.mp4 --preset reels --no-normalize   # report the loudness, deliver the sound as it is
   python3 export.py final.mp4 --preset prores -o master.mov
   python3 export.py final.mp4 --preset dnxhr-hq -o master.mov
   python3 export.py final.mp4 --preset copy -o delivered.mp4
@@ -48,13 +48,15 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from _common.runner import carried_stream_maps, child_exit_code, fail_if_classified, kept_clause, mark_delivered
+from _common.color import bt709_matrix_filter, hdr_rgb_matrix_args, hdr_rgb_matrix_filter
 from _common import STATE, run_analysis, add_common, apply_common, bt709_label_filter, bt709_matrix_args, bt709_tag_args, child_args, emit, cfr_args, cfr_filter, default_output, die, encoder_args, ffmpeg_base, info, probe, require_tool, run, run_tool, validate_color, pad_filters, add_pad_fill_args, fmt_secs
 from _common.decision import chain_with_rate, hw_preset_video, restate_last_swap
-from _common.emit import note, record_fallback, record_skip, warn
-from _common.probe import PROBED_AUDIO, PROBED_VIDEO, probed_maps, square_pixels, square_pixels_note
+from _common.emit import note, record_fallback, record_skip, refuse, stream_inventory_step, warn
+from _common.probe import AUDIO_MEDIA_EXT, PROBED_AUDIO, PROBED_VIDEO, display_size, probed_maps, square_pixels, square_pixels_note
 from _common.runner import ffmpeg_encoders, guard_sidecar, remember_written, replace_checked, replace_checked_together, reserve_sibling, subtitle_codec_for
 from _common.emit import file_identity, input_length, own_length, refuse_still
 from check import SPECS as PLATFORMS, measure_loudness
+from fit import measure_picture
 from _common.probe import SILENT_PEAK_DBFS, shorter_than_a_loudness_block
 from _platforms import ALIASES as _ALIASES, PLATFORMS as PLATFORM_TABLE, TP_TOLERANCE_DB, UPLOAD_LIMITS_AS_OF, resolve as resolve_platform
 # Frame and duration limit come from the one platform table (scripts/_platforms.py) rather than
@@ -72,6 +74,47 @@ def _loudness_step(ok: bool, platform: str, spec: dict, m: dict) -> dict:
             "expected": expected, "measured": measured, "delta": delta,
             "tolerance": {"lufs": spec["lufs_tol"], "tp": TP_TOLERANCE_DB}, "provenance": "specification"}
 
+def _verify_delivery(args, preset: dict, source: dict, output: str, streams: dict,
+                     encoder: Optional[str], extra: dict) -> None:
+    """Enforce requested delivery properties using the final file, including after normalization."""
+    if STATE.dry_run:
+        return
+    written = probe(output, role="output")
+    video = written.get("video") or {}
+    steps = extra.setdefault("verification", [])
+    codec = preset.get("codec") or (preset.get("expect") or {}).get("codec")
+    codec = codec or {"libx264": "h264", "h264_videotoolbox": "h264", "libx265": "hevc",
+                      "hevc_videotoolbox": "hevc"}.get(encoder)
+    if encoder == "copy":
+        codec = source["video"].get("codec")
+    if codec and not any(step["step"] == "codec" for step in steps):
+        measured = video.get("codec")
+        steps.append({"step": "codec", "property": "video_codec", "ok": measured == codec,
+                      "expected": codec, "measured": measured, "provenance": "specification"})
+    if preset["w"] and preset["h"] and not args.no_scale:
+        expected = [preset["w"], preset["h"]]
+        measured = [video.get("width"), video.get("height")]
+        steps.append({"step": "frame_size", "property": "frame_size", "ok": measured == expected,
+                      "expected": expected, "measured": measured, "provenance": "specification"})
+    if "-r" in preset["video"]:
+        expected = float(Fraction(preset["video"][preset["video"].index("-r") + 1]))
+        measured = video.get("fps")
+        tolerance = 0.005  # accommodate probe rounding while distinguishing 29.97 from 30
+        steps.append({"step": "frame_rate", "property": "fps",
+                      "ok": measured is not None and abs(measured - expected) <= tolerance,
+                      "expected": expected, "measured": measured, "tolerance": tolerance,
+                      "provenance": "specification"})
+    inventory = stream_inventory_step(written, streams)
+    hard = {"streams", "codec", "frame_size", "frame_rate", "duration", "file_size"}
+    failed = [step["step"] for step in [*steps, inventory] if step["step"] in hard and step.get("ok") is not True]
+    if failed:
+        checked = [{**step, "attribution": step.get("attribution") or "unresolved"} if step.get("ok") is False
+                   else step for step in [*steps, inventory]]
+        details = dict(extra, verification=checked, output=output, probe=written, verified=False,
+                       dry_run=False, output_identity=file_identity(output))
+        die(f"export verification failed ({', '.join(failed)}); kept {output}", kind="verification", **details)
+
+
 def _from_table(dest: str, **over) -> Dict:
     """A preset's w/h/max read from PLATFORMS[dest], with the encoder settings given here.
 
@@ -86,6 +129,20 @@ def _from_table(dest: str, **over) -> Dict:
            "max": float(max_duration) if max_duration is not None else None}
     out.update(over)
     return out
+
+
+def _center_crop_geometry(sw: int, sh: int, w: int, h: int) -> tuple:
+    """Source-pixel margins of the preset's scale-to-cover and centred 4:2:0 crop."""
+    # FFmpeg's scale rounds the non-binding side to nearest (halves up); crop floors the
+    # centred offsets to even pixels for chroma. Leave the existing encode filters unchanged.
+    scaled_w = max(w, (2 * h * sw + sh) // (2 * sh))
+    scaled_h = max(h, (2 * w * sh + sw) // (2 * sw))
+    mx, my = scaled_w - w, scaled_h - h
+    x, y = 2 * (mx // 4), 2 * (my // 4)
+    return scaled_w / sw, {
+        "left": round(x * sw / scaled_w), "right": round((mx - x) * sw / scaled_w),
+        "top": round(y * sh / scaled_h), "bottom": round((my - y) * sh / scaled_h),
+    }
 
 
 _H264_HIGH = ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-profile:v", "high", "-pix_fmt", "yuv420p"]
@@ -306,7 +363,7 @@ def _loudness_unmeasured(extra: Dict[str, object], notes: List[str], platform: s
     reason = "not_measured"
     extra["loudness"] = {"lufs": None, "tp": tp, "target_lufs": spec["lufs"], "target_tp": spec["tp"], "ok": None,
                          "measured": False, "reason": reason, **({"too_short": True} if tp is not None else {}),
-                         **({"normalized": True} if normalized else {})}
+                         "normalized": normalized}
     extra["verification"] = [{"step": "loudness", "ok": False, "platform": platform, "reason": reason}]
     why = ("the audio is shorter than one 400 ms loudness block, so it has a true peak but no integrated loudness"
            if tp is not None else "ffmpeg's loudnorm output did not parse")
@@ -524,9 +581,14 @@ def main() -> int:
                          "negative timestamps shifted to zero -- and count the decode errors and timestamp warnings "
                          "before and after; the input is never touched")
     ap.add_argument("--max-mb", type=float, metavar="MB",
-                    help="fit the file under MB megabytes (MiB): a two-pass x264 encode at the video bitrate the "
+                    help="the max size of the file: fit it under MB megabytes (MiB), a two-pass x264 encode at the video bitrate the "
                          "running time leaves after the audio, measured afterwards (H.264 presets; not with --crf or --hw)")
-    ap.add_argument("--normalize", action="store_true", help=f"the platform presets ({', '.join(sorted(PLATFORM_OF))}): when the written file misses the platform's loudness spec, run loudness.py on it (audio re-encoded, video copied) so one export delivers")
+    # 4.0.0 (#579): a platform preset promises the platform's loudness, so it meets it by default
+    norm = ap.add_mutually_exclusive_group()
+    norm.add_argument("--normalize", action="store_true",
+                      help="platform presets: normalize audio when it misses the loudness spec (the default since 4.0.0). Video is copied.")
+    norm.add_argument("--no-normalize", action="store_true",
+                      help="platform presets: measure and report the loudness but deliver the sound as it is (3.x's default)")
     ap.add_argument("--alpha-mode", choices=["straight", "premultiplied"],
                     help="alpha presets (prores4444, prores4444xq, qtrle, vp9-alpha, hap-alpha): write the colour straight "
                          "(default, as decoded) or premultiplied by the alpha; written to the result as alpha_mode")
@@ -544,9 +606,11 @@ def main() -> int:
     if not args.input or not args.preset:
         die("input and --preset are required (or use --list)")
     validate_color(args.pad_color, "--pad-color")
-    if args.normalize and args.preset not in PLATFORM_OF:
-        die(f"--normalize applies to the platform presets ({', '.join(sorted(PLATFORM_OF))}); --preset {args.preset} has no loudness spec to meet",
-            hint="drop --normalize, or run loudness.py with your own target")
+    if (args.normalize or args.no_normalize) and args.preset not in PLATFORM_OF:
+        flag = "--normalize" if args.normalize else "--no-normalize"
+        die(f"{flag} applies to the platform presets ({', '.join(sorted(PLATFORM_OF))}); --preset {args.preset} has no loudness spec to meet",
+            hint=f"drop {flag}, or run loudness.py with your own target")
+    args.normalize = args.preset in PLATFORM_OF and not args.no_normalize
 
     p = PRESETS[args.preset]
     meta = probe(args.input)
@@ -601,20 +665,31 @@ def main() -> int:
     # metadata.py's does): default_output()'s .webm -> .mp4 is for the re-encoding presets
     output = args.output or default_output(args.input, args.preset, p["ext"] or Path(args.input).suffix.lstrip(".") or None)
     out_ext = Path(output).suffix.lstrip(".").lower()
+    # The runner's picture check looks for a video encoder. Copy and GIF do not name one.
+    if args.preset in ("copy", "gif") and "." + out_ext in AUDIO_MEDIA_EXT:
+        refuse("input", "output_extension_audio_only",
+               f"output {output!r}: .{out_ext} holds sound only, and --preset {args.preset} writes a picture",
+               hint="name a video file for this preset, or extract the sound with cut.py or audio.py",
+               output=output, extension="." + out_ext, encoders=["gif"] if args.preset == "gif" else [])
 
     vf: List[str] = []
+    picture_filters: List[str] = []
     # A GIF is RGB: an untagged SDR source is labelled BT.709 (tags only) for palettegen's conversion,
     # which read "unknown" as BT.601 (C03028 came out B31F28, #410); a tagged one is read by its tag
     gif_label = bt709_label_filter(meta) if args.preset == "gif" else None
     if p["w"] and not args.no_scale:
         if p["h"]:
             if args.fit == "crop":
-                vf += [f"scale={p['w']}:{p['h']}:force_original_aspect_ratio=increase", f"crop={p['w']}:{p['h']}"]
+                picture_filters = [f"scale={p['w']}:{p['h']}:force_original_aspect_ratio=increase", f"crop={p['w']}:{p['h']}"]
+                vf.extend(picture_filters)
             else:
                 # a --pad-color with chroma is drawn in the BT.709 the line is tagged with; a GIF is
                 # not tagged, and palettegen reads the pad back with the same BT.601 it was drawn in
                 vf.append(pad_filters(p["w"], p["h"], args.pad_fill, args.pad_color, args.pad_blur,
                                       meta=None if args.preset == "gif" else meta))
+                if not STATE.dry_run:
+                    picture_filters = [pad_filters(p["w"], p["h"], args.pad_fill, args.pad_color,
+                                                   args.pad_blur, meta=meta, blank=True)]
             vf.append("setsar=1")
         else:
             vf.append(f"scale={p['w']}:-2")
@@ -727,6 +802,10 @@ def main() -> int:
             # SDR hevc/av1 line's own): a BT.601 source's pixels are converted to match, in front
             # of the -vf above (run() folds the two); an untagged, BT.709 or HDR source adds nothing
             cmd += bt709_matrix_args(meta)
+        if p.get("codec"):
+            # encoder_args()' line for a BT.2020 / HDR source tags that source's matrix: an RGB
+            # one is made YUV with it, not with FFmpeg's BT.601 default (#544)
+            cmd += hdr_rgb_matrix_args(meta)
     if out_ext == "mp4":
         cmd += ["-movflags", "+faststart"]
     if args.repair:
@@ -757,8 +836,9 @@ def main() -> int:
         # and says so (#415)
         mark_delivered(output)
     result = probe(output, role="output")
-    v = result["video"]
-    info(f"wrote {output} ({fmt_secs(result['duration'])}, {v['width']}x{v['height']}, {v['codec']})")
+    v = result.get("video") or {}
+    if v:
+        info(f"wrote {output} ({fmt_secs(result['duration'])}, {v['width']}x{v['height']}, {v['codec']})")
     extra: Dict[str, object] = {"trimmed": trimmed} if trimmed else {}
     encoder = video[video.index("-c:v") + 1] if "-c:v" in video else None
     if p.get("expect") and not STATE.dry_run and encoder == p["video"][p["video"].index("-c:v") + 1]:
@@ -800,7 +880,8 @@ def main() -> int:
             _loudness_unmeasured(extra, notes, platform, spec)
         if m:
             ok = abs(m["lufs"] - spec["lufs"]) <= spec["lufs_tol"] and m["tp"] <= spec["tp"] + TP_TOLERANCE_DB
-            extra["loudness"] = {"lufs": m["lufs"], "tp": m["tp"], "target_lufs": spec["lufs"], "target_tp": spec["tp"], "ok": ok}
+            extra["loudness"] = {"lufs": m["lufs"], "tp": m["tp"], "target_lufs": spec["lufs"],
+                                 "target_tp": spec["tp"], "ok": ok, "normalized": False}
             extra["verification"] = [_loudness_step(ok, platform, spec, m)]
             if not math.isfinite(m["lufs"]):
                 # a silent output measures -inf LUFS: no gain reaches the target, so recommending
@@ -858,6 +939,10 @@ def main() -> int:
                 notes.append(f"loudness {m['lufs']:.1f} LUFS / {m['tp']:+.1f} dBTP is outside {platform}'s {spec['lufs']:g} LUFS / {spec['tp']:g} dBTP; "
                              f"run loudness.py -I {spec['lufs']:g} --tp {spec['tp']:g} on this file, or export with --normalize")
                 warn(notes[-1], "loudness_outside_spec", platform=platform, lufs=m["lufs"], tp=m["tp"], normalized=False)
+        if m:
+            correction = "after correction" if extra["loudness"]["normalized"] else "without export correction"
+            info(f"loudness measured {correction}: {m['lufs']:.1f} LUFS / {m['tp']:+.1f} dBTP "
+                 f"(target {spec['lufs']:g} LUFS / {spec['tp']:g} dBTP)")
     elif platform and not has_audio and not STATE.dry_run:
         record_skip(f"no loudness check against {platform}'s spec: the source has no audio, so the export has none",
                     "loudness_no_audio", platform=platform)
@@ -910,10 +995,21 @@ def main() -> int:
                      f"({', '.join(sorted({d['type'] + ': ' + d['reason'] for d in non_av['dropped']}))}); non_av_streams lists them")
     extra["non_av_streams"] = non_av
     extra["dropped_non_av_streams"] = bool(non_av["dropped"])
+    if picture_filters and not STATE.dry_run:
+        sw, sh = display_size(meta["video"])
+        scale, cropped = (None, None)
+        if args.fit == "crop" and sw and sh:
+            scale, cropped = _center_crop_geometry(sw, sh, p["w"], p["h"])
+        written_video = probe(output, role="output").get("video") or {}
+        matrix = hdr_rgb_matrix_filter(meta) if p.get("codec") else None
+        extra["picture"] = measure_picture((picture_filters, scale, cropped), meta, sw, sh, written_video,
+                                           sized=True, matrix_filter=matrix or bt709_matrix_filter(meta))
     if notes:
         extra["notes"] = notes
     # the delivery keeps the source's picture and, except as a GIF, its sound
-    extra["expect_streams"] = {"video": int(bool(meta.get("video"))), "audio": int(bool(has_audio and args.preset != "gif"))}
+    streams = {"video": 1, "audio": int(has_audio)}
+    _verify_delivery(args, p, meta, output, streams, encoder, extra)
+    extra["expect_streams"] = streams
     extra["stream_reference"] = [meta]
     if trimmed:  # only the kept 0..max of the source can have handed its gap to the output
         extra["stream_windows"] = [(0.0, float(p["max"]))]

@@ -9,13 +9,14 @@ import json
 import math
 import os
 import re
+import stat
 import statistics
 import sys
 from array import array
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from _common.emit import die, refuse, warn
-from _common.runner import ffmpeg_failure_extra, STATE, dry_run_input_pending, require_tool, run, run_analysis, still_input_args
+from _common.runner import ffmpeg_failure_extra, refuse_denied_input, STATE, dry_run_input_pending, register_plan_input, require_tool, run, run_analysis, still_input_args
 
 # The streams probe() describes, as stream specifiers: its `video` is the first picture that is not
 # a cover (`V`), its `audio` the first sound stream. Without a -map, FFmpeg picks the largest
@@ -26,22 +27,38 @@ PROBED_VIDEO = "V:0"
 PROBED_AUDIO = "a:0"
 
 
-def fingerprint(path: str) -> Dict[str, Any]:
+def fingerprint(path: str, *, complete: bool = False) -> Dict[str, Any]:
     """Size plus a sha256 over the first and last 8 MiB: enough to notice a re-export, a re-trim
     or a swapped file, cheap enough for a multi-GB source (hashing a whole master would make
-    planning slower than the edit)."""
+    planning slower than the edit). Sequence plans also request a full-file hash."""
     import hashlib
-    st = os.stat(path)
     h = hashlib.sha256()
     chunk = 8 * 1024 * 1024
-    with open(path, "rb") as f:
+    # A file could have been replaced by a FIFO since the caller checked its type.
+    def open_without_waiting(name, flags):
+        return os.open(name, flags | getattr(os, "O_NONBLOCK", 0))
+
+    with open(path, "rb", opener=open_without_waiting) as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path!r} is not a regular file")
         h.update(f.read(chunk))
         if st.st_size > 2 * chunk:
             f.seek(-chunk, os.SEEK_END)
             h.update(f.read(chunk))
         elif st.st_size > chunk:
             h.update(f.read())
-    return {"path": os.path.abspath(path), "size": st.st_size, "sha256_head_tail": h.hexdigest()}
+        result = {"path": os.path.abspath(path), "size": st.st_size, "sha256_head_tail": h.hexdigest()}
+        if complete:
+            if st.st_size > 2 * chunk:
+                whole = hashlib.sha256()
+                f.seek(0)
+                for data in iter(lambda: f.read(chunk), b""):
+                    whole.update(data)
+                result["sha256_full"] = whole.hexdigest()
+            else:
+                result["sha256_full"] = result["sha256_head_tail"]
+    return result
 
 
 def decode_pcm_mono(path: str, sample_rate: int, seconds: Optional[float] = None, start: float = 0.0,
@@ -55,6 +72,7 @@ def decode_pcm_mono(path: str, sample_rate: int, seconds: Optional[float] = None
     float, 8 for the slot), so scenes.py held ~2.3 GB per hour of audio at 8 kHz + 22.05 kHz and
     multicam --switch energy one such list per camera (A140). An s16 sample divided by 32768 is
     exact in a float32, so every value read back is the double the list held."""
+    register_plan_input(path)
     ffmpeg = require_tool("ffmpeg")
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
     if start:
@@ -101,7 +119,7 @@ def rms_envelope(samples: Sequence[float], step: int, *, full_blocks_only: bool 
 # the audio members of MEDIA_EXT: every audio file this skill reads, a wider set than the audio
 # outputs it writes (AUDIO_CODECS / is_audio_output() -- no .wma there: an output named so is
 # refused, decision.UNWRITTEN_AUDIO_EXT)
-AUDIO_MEDIA_EXT = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".aif", ".aiff", ".caf", ".wma"}
+AUDIO_MEDIA_EXT = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".aif", ".aiff", ".caf", ".mka", ".wma"}
 MEDIA_EXT = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".ts", ".mts", ".m2ts", ".mxf", ".3gp", ".wmv", ".gif",
              ".png", ".jpg", ".jpeg", ".webp"} | AUDIO_MEDIA_EXT
 
@@ -148,7 +166,7 @@ def verify_output(path: str) -> Dict[str, Any]:
     """The success criterion for every writing tool: the file exists, is not empty and ffprobe
     can read at least one stream from it. Non-media artifacts (srt, edl, html, md) only need to
     exist and be non-empty. Returns the probe (empty dict for non-media)."""
-    if not os.path.exists(path):
+    if not os.path.isfile(path):
         _output_failed(path, "not written")
     if os.path.getsize(path) == 0:
         _output_failed(path, "0 bytes")
@@ -215,31 +233,59 @@ def shorter_than_a_loudness_block(length: "Optional[float]") -> bool:
     return length is not None and 0 < length < LOUDNESS_BLOCK_SECONDS
 
 
-def riff_wave_args(path: str) -> List[str]:
-    """`-f wav` for a file that opens with a RIFF/WAVE header. FFmpeg 9.0.2 scores its MPEG-TS
-    probe above the WAV one when the PCM happens to hold 0x47 at a transport packet's spacing (a
-    steady tone can): ffprobe then reads a file this skill has just written as a broken transport
-    stream and fails with "End of file". The header says what the file is, so the probe is told.
-    Measured on 9.0.2 (CI): the same file fails unforced and reads with `-f wav`; 6.1 to 8.0 read
-    it either way."""
-    if not os.path.isfile(path):  # a pipe or a device is never opened here: the open would block
-        return []
+# ffmpeg's log prefix for a component, with the address of its context: `[mov,mp4,m4a @ 0x55d1]`
+# (no `0x` on Windows). It differs on every run and tells a caller nothing.
+_LOG_CONTEXT_RE = re.compile(r"\[[^\]\n]*@ (?:0x)?[0-9A-Fa-f]+\]\s*")
+
+
+def _refuse_unusable_input(path: str) -> None:
+    """Say what an input that cannot be media is, before ffprobe is asked (#558): a directory, an
+    empty file (the usual trace of a recording, download or TTS step that failed after creating
+    its file) or a file the user may not read. Each reached ffprobe and came back as its raw
+    text ("moov atom not found", "Is a directory") with no reason and no hint; join.py's
+    preflight has worded the first two itself since 2.2."""
+    if os.path.isdir(path):
+        refuse("input", "input_is_directory", f"input is a directory, not a file: {path}",
+               hint="pass one media file; verify.py and batch.py take a folder", path=path)
+    if not os.path.isfile(path):
+        return  # a pipe or a device: run() refuses it (media_path_not_a_file)
+    refuse_denied_input(path)
     try:
-        with open(path, "rb") as fh:
-            head = fh.read(12)
+        empty = os.path.getsize(path) == 0
     except OSError:
-        return []
-    return ["-f", "wav"] if head[:4] == b"RIFF" and head[8:12] == b"WAVE" else []
+        return
+    if empty:
+        refuse("input", "input_empty", f"input is empty (0 bytes): {path}",
+               hint="the step that should have written it wrote nothing: record, download or render it again", path=path)
 
 
-def probe(path: str, role: str = "input") -> Dict[str, Any]:
+def _refuse_not_media(path: str, stderr: str) -> "None":
+    """ffprobe could not read an input: `input_not_media`, with ffprobe's own lines as the detail
+    (their `[demuxer @ 0x...]` prefixes removed, #558) and a hint. The message still opens with
+    "ffprobe failed on PATH", which verify.py's report rows and callers have matched since 1.x."""
+    lines = [_LOG_CONTEXT_RE.sub("", ln).strip() for ln in (stderr or "").strip().splitlines()]
+    detail = "; ".join(dict.fromkeys(ln for ln in lines if ln)) or "ffprobe gave no reason"
+    hint = ("pass a video, audio or picture file; a recording or a copy that was cut short reads this way too "
+            "(\"moov atom not found\") and has to be copied again from its source")
+    refuse("input", "input_not_media", f"ffprobe failed on {path}: not a media file ffprobe can read ({detail})",
+           hint=hint, path=path)
+
+
+def probe(path: str, role: str = "input", *, required: bool = True) -> Dict[str, Any]:
     """Return a compact, script-friendly description of a media file.
 
     role="output" marks a file this tool just wrote: a read failure is then reported as an
-    output-verification failure (kind "output") instead of an input problem."""
+    output-verification failure (kind "output") instead of an input problem.
+    For an aggregate's evidence check, required=False returns {} on an unreadable file."""
     if not os.path.exists(path) or (role == "output" and STATE.dry_run):
+        if not required:
+            return {}
         if role == "output" and not STATE.dry_run:
             _output_failed(path, "not written")
+        if role == "input":
+            # a file behind a directory the user may not search is not "not found", and not an
+            # earlier dry-run stage's output either (#558)
+            refuse_denied_input(path)
         if STATE.dry_run:
             # also for an output path that holds a file: a dry run did not write it, and reading it
             # reported an earlier run's file as this plan's result (#403: cut.py's output_duration)
@@ -256,18 +302,28 @@ def probe(path: str, role: str = "input") -> Dict[str, Any]:
                               "color_transfer": None, "color_primaries": None, "rotation": 0, "variable_frame_rate_suspected": False},
                     "audio": {"codec": None, "channels": 0, "sample_rate": 0}, "subtitle_streams": 0, "data_streams": 0}
         die(f"input not found: {path}")
+    if role == "input":
+        if not required and (os.path.isdir(path) or (os.path.isfile(path) and os.path.getsize(path) == 0)):
+            return {}  # an optional probe reports "not usable" as {} (as a failed ffprobe did), never exits
+        _refuse_unusable_input(path)
     ffprobe = require_tool("ffprobe")
     proc = run(
-        [ffprobe, "-v", "error", *still_input_args(path), *riff_wave_args(path),
+        [ffprobe, "-v", "error",
          "-print_format", "json", "-show_format", "-show_streams", "-show_chapters", path],
         quiet=True,
         check=False,
     )
     if proc.returncode != 0:
+        if not required:
+            return {}
         if role == "output":
             _output_failed(path, f"ffprobe cannot read it:\n{proc.stderr.strip()}")
-        die(f"ffprobe failed on {path}:\n{proc.stderr.strip()}")
+        _refuse_not_media(path, proc.stderr)
+    if role == "input":
+        register_plan_input(path)
     if not (proc.stdout or "").strip():
+        if not required:
+            return {}
         # ffprobe exited 0 and printed nothing we could read. Before 1.17.1 that produced a
         # SUCCESS document of nulls -- "?s | no video | no audio", exit 0 -- which is how #234
         # showed up on a Windows cp932 machine: the capture decoded ffprobe's UTF-8 JSON with the
@@ -284,6 +340,8 @@ def probe(path: str, role: str = "input") -> Dict[str, Any]:
     try:
         raw = json.loads(proc.stdout or "{}")
     except ValueError as e:
+        if not required:
+            return {}
         if role == "output":
             _output_failed(path, f"ffprobe printed unreadable JSON: {e}")
         die(f"ffprobe printed unreadable JSON for {path}: {e}", kind="ffmpeg")
@@ -350,6 +408,8 @@ def probe(path: str, role: str = "input") -> Dict[str, Any]:
         vfr = bool(r_rate and avg_rate and abs(float(r_rate) - float(avg_rate)) > 0.01)
         w, h = _to_int(video.get("width")), _to_int(video.get("height"))
         if not (w and h) and _is_still(fmt, video):
+            if not required:
+                return {}
             # audit A184 (#465): a text file named .png reaches the image demuxer, which lists a
             # png stream it could not decode as 0x0. That was reported as a measured picture
             # (probe.py exit 0) and divided by in insert.py and check.py (tracebacks, no JSON).
@@ -1486,8 +1546,8 @@ def change_tiles(path: str, reference: str, floor: int, grid: "Tuple[int, int]" 
            "-filter_complex", graph, "-map", "[o]", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     # read frame by frame as ffmpeg writes them: 1728 bytes a frame is 187 MB for an hour at
     # 30 fps, and only the frames with a changed tile are kept. Same wall-clock limit as run_analysis()
-    cmd = _runner.guard_still_patterns(cmd)  # a still named with a % is that one file (#465 A7)
     _runner._refuse_url_media(cmd)
+    cmd = _runner.guard_input_names(cmd)
     limit = _runner._limit_for(cmd)
     size, tiles = gw * gh * 3, gw * gh
     changed: Dict[int, int] = {}

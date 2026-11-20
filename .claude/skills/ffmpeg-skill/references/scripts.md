@@ -2,6 +2,23 @@
 
 Every script prints the same information with `--help`; this file exists so the agent can read several at once. All scripts accept `--dry-run`, `--json`, `--json-brief` (since 1.11.0: the same JSON result trimmed to `status`, `output`, `dry_run`, `verified`, a compact `summary` of the output probe -- duration_s, width, height, fps, vcodec, acodec, channels, and lufs when measured -- the tool's own keys, and the count of commands instead of the command lines; it implies `--json`, leaves `--json`'s own output untouched, and failures print the usual full failure document), `--fast`, `--progress`, `--timeout SECONDS`, `--overwrite`, `--plan FILE` (the dry run written as a plan document that `render.py FILE` executes later; see render.py; `render.py` and `verify.py` refuse it), `-o OUT` (except `probe`, `check`, `cropdetect`, `scenes`, `batch` and `verify`, which take none); every re-encoding tool and `export.py` also take `--hw`/`--no-hw` (h264/hevc/prores on Apple VideoToolbox, Apple Silicon only, CRF mapped to `-q:v`; AV1 stays on the CPU; a job VideoToolbox itself refuses -- the encoder cannot open or its compression session fails -- is re-encoded on the CPU and reported in `hw.fallback`/`hw.notes`, any other failure is not retried; a GPU encode adds a `notes` line that its quality is not CRF-equivalent; `FFMPEG_SKILL_HW=1` makes it the default for every tool except `export.py`, whose delivery presets need `--hw` itself; `render.py`/`batch.py --hw`/`--no-hw` apply to every stage, export included; results name the `encoder` that ran); every editing tool that re-encodes (not `export.py`, whose preset decides the codec) also takes `--codec h264|hevc|av1|prores` (the encoder for the re-encode; default x264 for SDR, x265 Main10 for HDR, unchanged) and `--quality N` (CRF scale, default 18 -- 30 for `proxy.py`; up to 63 for av1; ignored by prores). 2.0 removed `--crf` from these tools (it was `--quality`'s alias); `export.py` keeps its own `--crf`, which is not an alias. Every tool refuses (`kind: input`, `error.reason: output_exists`, before anything runs) to replace an existing output unless `--overwrite` is given. Refusals carry `error.reason` and `error.details` (the facts behind the message; `contract --json` → `json_output.error_reasons`), and what a run decided on its own -- a stale output lock taken over, no lock possible, a plan input nobody fingerprinted, an odd-sized frame scaled to even, subtitle streams dropped on a retry (with the first attempt's error), a font substituted, a measurement skipped under `--dry-run`, an encoder list that could not be read, an invalid `FFMPEG_SKILL_TIMEOUT`, and every `warning:` line -- is in `diagnostics: {warnings, fallbacks, skipped}` as well as on stderr (codes: `contract --json` → `json_output.diagnostic_codes`). `--codec av1`/`prores` with no encoder for it refuses `kind: missing_tool`, `error.reason: encoder_missing`; when the encoder list could not be read at all, `kind: ffmpeg`, `encoder_list_unreadable`. Tools that draw text (`overlay.py --text`, `graphics.py`, `caption.py`, `grid.py --label auto`) report `font_used: {asked, file, family, how, substituted}`. `--codec hevc` on SDR writes 8-bit BT.709 HEVC (`hvc1`), `av1` uses SVT-AV1 (libaom fallback), `prores` is 422 HQ and needs an explicit `-o NAME.mov` (or `.mkv`), `h264` refuses an HDR source (`kind: input`, run `color.py --to-sdr` first). `export.py` keeps choosing the codec from its preset and has neither `--codec` nor `--quality`; a `render.py` project cannot choose a codec either -- but `--dry-run` only guarantees nothing is written for writing tools: `probe` (read-only, `--dry-run` changes nothing) still runs ffprobe, and with `--analyze` ffmpeg to sample picture levels, `check`/`sync`/`multicam`/`scenes`/`cropdetect`/`report`/`silence`/`loudness`/`stabilize` still run their ffmpeg/ffprobe measurements (a dry-run plan rests on real numbers; they just don't write the final artifact), `overlay` measures a multi-line `--text`'s lines on FFmpeg 8.0, 8.0.1 and 8.1.0 (one drawtext on a generated frame), `metadata` with `--auto-chapters` and `cut` with `--snap beats` decode the input for their measurement, `render` and `batch` run each stage or step as its own dry run (so a measuring stage measures an input that exists), and `verify` accepts the flag but ignores it entirely (its document says `dry_run: false` and a note says so). Exact per-tool semantics: `contract --json`'s `dry_run` field (or `docs/contract.md`).
 
+## File names and unusable inputs (every tool)
+
+A still whose name holds a `%` (`a%20b.png`, `logo%d.png`) is read as that one file, never as a
+numbered sequence. A relative path with a colon given to `--srt`, `--ass`, `--lut`, `--font-file`
+or `--fonts-dir` works as written (`./a:b.srt`, `a:b.srt`). An input whose name starts with `-`
+is read as a file: pass it after `--` or as `./-name.mp4`; an output starting with `-` is refused
+(`output_looks_like_option`; pass `./NAME`). For the primary media input, before ffprobe runs:
+`kind: input` with a hint, `input_is_directory`, `input_empty` (0 bytes) or
+`input_permission_denied` (the file or a directory on the way to it is not readable; a path that
+is not there is "input not found"); `input_not_media` comes after, when ffprobe cannot read it.
+A side file (`--lut`, `--srt`, a font) is checked by its own flag, and a tool's own preflight
+(`render.py`'s project and template inputs, `join.py --list`) runs before this one; either may
+word the same problem differently, without these reasons.
+For the output, before ffmpeg runs: `output_extension_missing` and
+`output_extension_unknown` (an extension the installed FFmpeg has no muxer for, such as
+`out.xyz`; a command that names its format with `-f` is exempt).
+
 ## Time grammar (every time-taking flag, 1.9)
 
 One parser, `time_arg()`, behind every `--start`, `--end`, `--at`, `--from`,
@@ -237,7 +254,12 @@ Irregular timing between the windows is not seen; `--accurate` is always availab
 
 A source with no B-frames (iPhone "Most Compatible" H.264) cuts its parts as
 every 2.x release did: from the keyframe at (or before) each start to the end
-asked for, each part within `--tolerance`. On B-frame video a copied
+asked for, each part within `--tolerance`. A multi-segment copy also checks the
+written total in `verification` (`cut_total_duration`). The total's tolerance is
+the smaller of `--tolerance` and the requested length, with a floor of one source
+frame for video. With `--tolerance -1`, the requested length still bounds the
+verification. A miss keeps the written copy with `verified: false` and a note
+that suggests `--accurate`. On B-frame video a copied
 `.mp4`/`.mov` part runs from the keyframe at (or before) its start to the first
 keyframe at or after its end (never an earlier one), each end within
 `--tolerance`, so the join is the source's own frames with no gaps; a later
@@ -313,8 +335,11 @@ fit.py INPUT [--duration T --method speed|trim [--from-center] [--max-speed 4]]
              [--aspect 16:9|9:16|1:1|4:5|W:H --fit pad|crop|blur [--width W] [--height H] [--pad-color black] [--pad-fill color|blur [--pad-blur 20]]]
              [--rotate 90|180|270] [--flip h|v] [--fps N] [-o OUT]
 ```
-`speed` retimes video and audio together (pitch-preserving `atempo`); it
-refuses factors beyond `--max-speed`. For slow motion add `--smooth blend`
+`speed` retimes video and audio together (pitch-preserving `atempo`). For
+factors above 1.15 or below 1/1.15, choose an explicit `--method speed`
+or a slow-motion filter when stretching. The result reports `large_speed_change`.
+An implicit large retime fails with `fit_method_required`. The separate
+`--max-speed` limit still applies. For slow motion add `--smooth blend`
 (frame blending, fast) or `--smooth interpolate` (motion-compensated
 `minterpolate`, fluid but roughly 10-20x slower than realtime; its frames are
 made at `--fps` when given, else at the source's rate). `trim` keeps
@@ -342,6 +367,14 @@ frame's area), `scale` (its width over the source's) and, for `--fit crop`, the 
 pixels `cropped` on each side. It is measured by running the frame's own filters on a
 uniform frame (no decode of the source), so a 202x360 frame holding a 202x114 picture is told
 apart from a full-frame crop without a contact sheet; `subject_framing` stays unverified.
+After a crop with a discarded margin, `crop_check` samples the kept source time
+range and checks where luma motion falls. It uses edge detail when motion falls
+below its measurement threshold. A `crop_content_off_centre` warning may suggest
+`--crop-x` or `--crop-y`. An unavailable measurement reports `unmeasured`.
+The warning can flag an individual sample even when most motion stayed in frame.
+Use `look.py OUTPUT --at TIME` for each `crop_check.review_points[].output_time_estimate`
+that is available. To compare a trimmed or retimed output with its input, extract the
+source frame separately using the point's `source_time`.
 `--duration` on a still picture is refused (it has no length: `insert.py` makes a clip of it).
 
 ### crop.py — crop to an exact pixel rectangle
@@ -533,8 +566,8 @@ run time. The frames keep their times, so the source's subtitle track is kept
 as `crop.py` keeps it (`dropped_non_av_streams` says when it could not be).
 vid.stab aborts on an RGB picture, so an RGB source (a PNG, a qtrle or
 PNG-in-MOV clip) is stabilized as a YUV 4:4:4 copy (converted to BT.709 as every SDR RGB
-re-encode is; FFmpeg's own conversion on a `--codec prores` line and for an HDR or
-BT.2020 RGB source, as every tool's), with a note; the
+re-encode is, or, for an HDR or BT.2020 RGB source, with the matrix its 10-bit line tags;
+FFmpeg's own conversion for an SDR source on a `--codec prores` line), with a note; the
 output's pixel format is the encoder line's (`probe.video.pix_fmt`).
 
 ### sequence.py — numbered/globbed image sequence to video
@@ -552,7 +585,7 @@ PNG) is refused, `kind: input`, `reason: still_unreadable`, with the frames
 named. When ffprobe fails on the frame list or reads back no frame, the frames
 are not checked: a note says so and the encode runs.
 
-### waveform.py — audio waveform/spectrum visualization video
+### waveform.py — audio visualization and cut-review PNGs
 ```
 waveform.py INPUT [--style waveform|spectrum] [--width W] [--height H] [--fps N]
                    [--color C] [--background C] [--waveform-mode M] [--split-channels]
@@ -560,6 +593,7 @@ waveform.py INPUT [--style waveform|spectrum] [--width W] [--height H] [--fps N]
                    [--position bottom|centre|top|strip] [--vis-height FRAC] [--opacity 0..1]
                    [--platform NAME] [--srt FILE | --text FILE] [--title TEXT] [--brand brand.json]
                    [--on-silent warn|fail] [--silence-threshold -50] [-o OUT]
+waveform.py INPUT --at TIME [--at TIME ...] [--window SECONDS] [-o OUT.png]
 ```
 Renders the input's audio as a video: `--style waveform` (default, FFmpeg's
 `showwaves`) draws amplitude over time; `--style spectrum` (`showspectrum`)
@@ -569,6 +603,14 @@ carries the audio it visualizes. The default output of an audio input is
 `<name>_waveform.mp4` (an audio extension cannot hold the picture), and `-o` with an audio
 extension is refused. For an audio-only input (no video stream
 needed) or any file with an audio track worth visualizing.
+
+For cut review, `--at` draws one waveform PNG per supplied time. The orange line marks
+that time and the label states the selected window length. `--window` is the full span
+around each point (default 2 seconds, maximum 30). Near either end it is clipped to the
+source. For multiple points, the file names use `_01.png`, `_02.png`, and so on.
+Use `--audio-stream` to choose the track. The JSON lists the written paths and windows in
+`waveforms`, or planned paths and windows in `planned_waveforms` on a dry run.
+Listen to the cut when deciding whether it interrupted speech.
 
 **Audiogram (1.16).** `--image PATH` puts a local still behind the
 visualisation, which is what turns a podcast episode into something postable.
@@ -887,9 +929,9 @@ Results: `filler.removed_count`, `filler.removed_seconds`, `filler.removed`
 (one entry per span), `filler.lang`, `filler.list`, `filler.word_timings` and
 `filler.warnings`; `--filler-lang auto` refuses (`kind: input`) a transcript in a language with no built-in list, so pass `--filler-words FILE` for it. With `--transcribe`, `filler.source` is `whisper:ENGINE` or
 `parakeet:ENGINE` and `filler.transcription` says which engine, model, language
-and routing made the words; a top-level `notes` line says when `--engine auto`
-ran the English-only Parakeet model on English assumed (no `--filler-lang`, and
-no Whisper engine that could take it). The existing `removed_seconds` keeps exactly the meaning it
+and routing made the words; with no `--filler-lang`, no detectable language and
+no Whisper engine that could take it, an English-only Parakeet model is not run
+and the call is refused (`reason: english_only`). The existing `removed_seconds` keeps exactly the meaning it
 has always had — the seconds of **silence** this run removed, the figure the
 same run would report without `--filler` — and `removed_seconds_total` is the
 additive sibling covering everything that went. A filler word quiet enough to
@@ -926,6 +968,10 @@ before its start with an edit list, every clip must lay out its streams as the f
 picture and sound must start, and end (start plus length), within 50 ms of each other (the demuxer starts the next clip where this one's container ends, so the shorter
 stream would leave that gap). Anything else is refused before ffmpeg runs (`kind: input`,
 `reason: join_copy_mismatch`, `details.clips: [{index?, path, differs}]` naming what differs).
+For AAC in MP4/MOV/M4V output, the preflight also measures the leading samples to skip
+on each clip after the first. A copy join can retain that padding at the seams. When the
+marked padding totals more than 50 ms, the copy is refused and `details.aac_priming_ms`
+reports the total. Drop `--copy` to decode each clip before joining independently encoded AAC.
 The join is written beside the output and measured before it is renamed into place: its video
 packet count must equal the clips' total and its video length their summed length. `mode` is
 `copy`. `--copy` does not take `--width`, `--height`, `--fps`, `--sample-rate`, `--channels` or a transition, and an
@@ -982,6 +1028,10 @@ A real render first runs its own dry run; when that is refused because a stage n
 encoder this build lacks (`filter_missing`, `encoder_missing`), the real run is refused with the dry
 run's document before the first stage encodes, not after the stages before it (`waveform.py` with a
 title or captions does the same).
+The optional `stage_pictures` object keeps the fit and export stages' frame geometry under
+their stage names. Each report measures its own stage's frame and counts cropped pixels
+from that stage's input. `picture` carries the last sizing stage's report when available.
+Cache hits replay recorded geometry. Dry runs omit both fields.
 A `captions` block with `text` (a cue file) delivers the SRT the captions stage generates as
 `<output>.srt` beside the output (`caption_srt`), guarded with the output before the first stage;
 it is not delivered (a `caption_srt_not_delivered` skip) when the stage came from `--cache` or the
@@ -1016,8 +1066,10 @@ fit.py's rule (`{aspect 16:9, width 1920}` is 1920x1080; an aspect alone takes t
 preset's size when the preset has that aspect; an aspect fit.py refuses, such as `16/9`, is
 refused unless the project's own `fit.aspect` replaces it in the render), with the project's
 `fit` object's aspect, mode, sides and rate in place of the frame's where it gives them, as
-the render's fit stage takes them, for one clip or several (#526). A clip of another
-aspect gets its spatial conform in FCPXML (`adjust-conform`: `fill` for `frame.fit: crop`,
+the render's fit stage takes them, for one clip or several (#526). A multi-clip
+project with an effective `fit: crop` crops each source into the delivery canvas
+at the join, so a clip of another aspect fills the frame without padding (#552).
+A clip of another aspect gets its spatial conform in FCPXML (`adjust-conform`: `fill` for `frame.fit: crop`,
 `fit` for pad); EDL and OTIO cannot state one. Everything else in the project -- captions,
 graphics, overlays, the silence cut, fit, a reframe the format cannot state (and `blur`'s
 background), audio processing, loudness, export -- is listed in the result's
@@ -1554,16 +1606,24 @@ above the cap is clamped with a note, not refused, and both `jobs` and
   `render.py` reads them: each item's copy of the project carries them absolute.
 
 ### caption.py --transcribe — optional local speech-to-text
+
+For Vietnamese, run `doctor --json` and inspect `fonts.scripts.vi`. Use an installed
+multilingual Whisper model, for example
+`caption.py input.mp4 --transcribe --lang vi --engine faster-whisper --model base`.
+To use reviewed captions, pass `--srt vi.srt --lang vi`; keep the SRT in UTF-8.
+If automatic lookup cannot verify the font, inspect the burned accents or point
+`--fonts-dir` and `--font` at a known face such as Noto Sans or DejaVu Sans.
+The burn-in tests use supplied cues and leave speech-recognition accuracy for review.
 If `parakeet-mlx`, `parakeet-cli` (parakeet.cpp, with a `.gguf`), `whisper-cli` (whisper.cpp),
 `faster-whisper` or `whisper` is installed,
 `caption.py input.mp4 --transcribe [--language ja] [--model base] [--engine auto]` writes the
 SRT from the audio and burns it (combine with `--animate pop --karaoke`). `--engine auto` (default,
 or `FFMPEG_SKILL_ASR_ENGINE`) runs Parakeet for English speech -- an English `--language`, else
 English from whisper.cpp's language detector -- and Whisper for any other language. When neither
-can name the language, a Whisper engine that can run goes first; Parakeet runs on English
-*assumed* only when no Whisper engine is installed or every one failed, and the result's
-top-level `notes` then says so: that transcript is wrong for non-English speech, so pass `--language`
-(`--filler-lang` for `silence.py`) when the speech may not be English.
+can name the language, a Whisper engine that can run goes first. When none can (none installed, or
+every one failed), an English-only Parakeet model is not run on speech nobody named: the call is
+refused before anything is written (`reason: english_only`), so pass `--language`
+(`--filler-lang` for `silence.py`), `en` included, or install a Whisper engine for other languages.
 `--engine parakeet-mlx|parakeet.cpp|whisper.cpp|faster-whisper|openai-whisper` forces one (a
 missing one is `kind: missing_tool`; an installed one that fails is `kind: input`, `reason:
 engine_failed`, with its own error line in `detail`). Without a language whisper.cpp is passed
@@ -1574,7 +1634,7 @@ whisper model (default `FFMPEG_SKILL_ASR_MODEL`, this machine's default, else `b
 English `tdt-0.6b-v2`. A Parakeet model in `FFMPEG_SKILL_ASR_MODEL` goes to the Parakeet engines
 only (the Whisper engines keep `base`); one given with `--model` goes to whichever engine runs.
 A non-English `--language` on an English-only Parakeet model is refused; a
-multilingual (v3) model assumes no language, so it gets no English-assumed note. The result's
+multilingual (v3) model assumes no language, so it runs when the language is not known. The result's
 `transcription` names the engine, model and routing. `silence.py --transcribe` (with `--filler`
 or a sentence flag) takes the same `--engine` and `--model`.
 Nothing is required: without an engine it prints install hints and the user can supply `--text`
@@ -1762,6 +1822,7 @@ seen before, and fix or report what fails.
 look.py INPUT [--tiles 4x3] [--width 1280] [-o sheet.png]         # contact sheet with timecodes (-o basename -> basename_sheet.png)
 look.py INPUT --at 2.5 [--at 7] [-o basename]                     # single frames -> basename_2.500s.png
 look.py BEFORE --compare AFTER --at 4 [-o cmp.png]                # side-by-side frame (-o basename -> basename_vs_AFTER_0_4.000s.png)
+look.py SOURCE --at 12.5 --compare CUT --compare-at 0 -o start.png # requested in-point beside cut start
 look.py INPUT --safe tiktok [--at 3]                              # shade what the app's UI covers
 look.py INPUT --guides title,action,4:3 [--at 3]                  # broadcast safe-area outlines
 ```
@@ -1770,8 +1831,11 @@ reaches a delivery): `action` 93 % and `title` 90 % of the frame (SMPTE ST 2046-
 centre 4:3 window of a wider frame with SD's 90 % action and 80 % title safe inside it (refused on
 a frame that is not wider than 4:3). It combines with `--safe PLATFORM` (the app's own UI zones)
 and works on a contact sheet's tiles as on a single frame; the result's `guides` lists them.
-An `--at` past the end of either picture is refused (`kind: input`); a still picture has one,
-at `--at 0`.
+`--compare-at` sets the right-hand seek on the comparison file's clock. Repeat it once per
+`--at`, in the same order. The default uses each `--at` seek on both sides. Each seek is
+checked against its own file's duration (`kind: input` if past the end). A still picture
+has one seek position, at zero. `comparisons`
+pairs each PNG with its two requested seek times. Inspect the frames to judge the cut.
 Outputs PNG. View it with the Read tool (or any image viewer) and judge the
 frame like an editor would. Use `--compare` to show before/after to the user. `--safe NAME` (1.14) shades the zones that
 destination's own UI covers -- TikTok's description block and like column, the Reels/Shorts
@@ -1895,8 +1959,16 @@ sizes itself, so `fit_scope` is `null` with a note.
 Text cue format, one per line: `0:00-0:03 Hello`, `00:00:03.500 --> 00:00:06 Two | lines`,
 or `00:00:03:15 --> 00:00:06:00 SMPTE non-drop-frame timecode` (`hh:mm:ss:ff`, frame count
 converted with `--fps`, or the input video's own fps when `--input` is given and `--fps` is
-not — a timecode-shaped cue with no fps available is refused rather than misread as plain text).
+not). An `@fps` suffix on a cue boundary overrides that rate. Use `hh:mm:ss;ff` for drop-frame
+labels at 29.97 or 59.94 fps. An invalid or skipped drop-frame label is refused. If the cue rate
+differs from the probed input rate, `caption_timecode_rate_mismatch` names the affected boundary
+and the estimated time difference when the input has a stable frame rate and the label is
+valid at that rate. Use seconds or
+word-level timestamps from a transcript when the source has a variable frame rate.
 Lines without a time run for `--auto-seconds` (3 s) after the previous cue. `|` is a line break.
+For Hebrew, Arabic and other right-to-left cues, generated styles use libass's
+whole-line bidirectional layout so edge punctuation and karaoke retain their reading order.
+An authored `--ass` file uses the styles in that file.
 `--animate`/`--karaoke` generate a styled ASS (PlayRes = video size) from the
 SRT/text cues: `pop` is the short-form "bouncy" entrance, `--karaoke` fills each
 word from `--color` to `--highlight-color` across the cue; `--karaoke-timing
@@ -1968,6 +2040,10 @@ frozen table, matched case-folded; `--lang`, else the script detector, picks the
 set, and with no language the union of the six is used). `--wrap measured` is 1.15's
 width-only wrap exactly, kept so an older split can be reproduced. The result's
 `caption` object carries the layout counts plus `wrap` and `phrase_breaks`.
+For Chinese cues, phrase wrapping keeps a short list of common two-character words,
+including `视频`/`視頻`, `效果` and `功能`, on the same line when they fit.
+This list works in Simplified and Traditional captions, including when the script is
+inferred. Use manual line breaks for other words that should stay together.
 graphics.py takes the same flag for the labels that can hold more than one line
 (the hook card, the meme lines, the sticker chip). The breaker never rewrites,
 shortens or translates the text: a cue that cannot fit `--max-lines` is split
@@ -2320,7 +2396,7 @@ The typed dynamics flags speak dB where the filter takes a linear value: a knee
 (2.82843); the defaults `--help` gives are ffmpeg's own, in the flag's unit (A135).
 `--bitrate` is the AAC rate beside a picture (192k) and the rate of a lossy audio output's
 codec (`.m4a`/`.aac` 256k, `.mp3` `-q:a 0`, `.ogg` `-q:a 6`, `.opus` 128k when it is not given);
-`.wav`, `.flac`, `.aif`/`.aiff` and `.caf` (16-bit PCM) refuse it (A143). A `--music-fade-out` on a bed shorter than the output (and
+`.wav`, `.aif`/`.aiff` and `.caf` (PCM), and `.flac` and `.mka` (FLAC), refuse it (A143). A `--music-fade-out` on a bed shorter than the output (and
 not `--music-loop`ed) ends where the bed ends (A142).
 With `--replace`, `--music` or a kept picture the sound is padded with silence or trimmed to the
 source's length counted in samples at the track's rate (`apad=whole_len=N,atrim=end_sample=N`),
@@ -2365,9 +2441,10 @@ requested lufs / tp / lra.
 
 Two-pass `loudnorm`: measure, then apply with measured values (linear mode when
 the true-peak ceiling allows). An audio output of a source whose sound starts after its picture
-holds that lead as silence, so the sound keeps its place (as in `audio.py` and `cut.py --accurate`). Video and any subtitle/data track are
-stream-copied (`dropped_non_av_streams` reports a track the container refused); audio becomes AAC in
-video containers or the codec matching the extension (.wav, .aif/.aiff, .caf → PCM, .flac, .mp3).
+holds that lead as silence, so the sound keeps its place (as in `audio.py` and `cut.py --accurate`). A video output
+stream-copies the picture and carries subtitle/data tracks where supported (`dropped_non_av_streams` reports a track the container refused).
+Audio-only outputs such as `.mka` keep the sound. Audio becomes AAC in
+video containers or the codec matching the extension (.wav, .aif/.aiff, .caf → PCM, .flac/.mka → FLAC, .mp3).
 The written file is measured again: a lossy encoder can push peaks past the
 ceiling loudnorm held (ffmpeg's AAC at 192k turned one transient from -2.4 to
 +3.7 dBFS). When it does, the tool re-encodes -- first at 256k then 320k if you
@@ -2375,19 +2452,22 @@ did not pass `--audio-bitrate` (an `.m4a`/`.aac` output starts at its 256k, so o
 left), then with the loudnorm ceiling lowered by the overshoot -- until the file itself meets
 `--tp`. A pinned `--audio-bitrate` reaches an audio output's codec as well as a video
 container's AAC (through 3.8.8 an `.m4a` was 256k whatever was asked, and its retries too);
-`.wav`/`.flac`/`.aif`/`.aiff`/`.caf` refuse it. `result` reports
+`.wav`/`.flac`/`.aif`/`.aiff`/`.caf`/`.mka` refuse it. `result` reports
 `tp_ceiling_used`, `audio_bitrate_used`, `encodes`, and a `note` when the
 integrated loudness ended more than 1 LU from the target because of it.
 
 ### export.py — delivery presets
 ```
 export.py INPUT --preset youtube|youtube4k|reels|tiktok|shorts|linkedin|facebook|x|youtube-hdr|youtube-av1|prores|dnxhr-lb|dnxhr-sq|dnxhr-hq|dnxhr-hqx|dnxhr-444|prores4444|prores4444xq|qtrle|vp9-alpha|hap-alpha|key-fill|h265|gif|copy
-                [--fit pad|crop] [--no-scale] [--allow-long] [--crf N | --max-mb MB] [--normalize] [-o OUT]
+                [--fit pad|crop] [--no-scale] [--allow-long] [--crf N | --max-mb MB] [--normalize | --no-normalize] [-o OUT]
 export.py INPUT --preset copy --repair [-o OUT]
 export.py --list
 ```
 A still picture is refused (`kind: input`) by every preset: a delivery has a length, and
 `insert.py` makes a clip of it.
+Presets with a fixed width and height report `picture` after a real scaled export. It
+describes the foreground rectangle and crop using the same fields as `fit.py`. It is
+absent with `--no-scale` or under `--dry-run`. Inspect the written frame to judge framing.
 Editing masters (`prores`, `dnxhr-lb/sq/hq/hqx/444`, and the alpha presets) keep the source's size,
 rate and colour tags and read the written codec and profile back (`codec` verification step).
 The alpha presets `prores4444`, `prores4444xq` (16-bit alpha), `qtrle`, `vp9-alpha` (WebM, Opus)
@@ -2420,23 +2500,31 @@ re-encoding preset decodes past them).
 `--max-mb MB` (2.24) fits the file under MB MiB: the preset's x264 line gets the video bitrate the
 running time leaves after the preset's audio bitrate (97% of the budget; the rest is container
 overhead) in place of its CRF, and the encode runs in two passes. The written size is measured: a
-`file_size` verification step, and a `size_over_limit` warning with a `notes` line when the encoder
-overshot. Refused for a preset that does not encode with x264 (and under `--hw`), with `--crf`,
+`file_size` verification step. If the encoder overshoots, the export exits nonzero and
+retains the file with a `size_over_limit` warning. Refused for a preset that does not encode
+with x264 (and under `--hw`), with `--crf`,
 for a source with no duration, and when the budget leaves under 100 kb/s for the picture.
 Scales into the preset frame (pad by default), tags BT.709 (a BT.601-matrix or RGB source is converted to it, as by every re-encode), sets `+faststart`,
 trims to the table's platform maximums (Reels 90 s, X 140 s; the table's as of its date, and
 platforms change them) unless `--allow-long`, and says
-so: `trimmed: {from, to}` and a `notes` line. It
-does not touch levels: for youtube / youtube4k / reels / x the written file is
-measured and the result's `loudness` (and a `notes` line) says when it is
-outside the platform's LUFS / true-peak spec, naming the `loudness.py` call
-that fixes it -- or pass `--normalize`, which runs that call on the written
-file itself (audio re-encoded, video copied; `loudness.normalized: true`) so a
-platform export is one command instead of export, loudness, export again. A
+so: `trimmed: {from, to}` and a `notes` line. For every platform preset (youtube, youtube4k, youtube-hdr, youtube-av1, reels, tiktok,
+shorts, linkedin, facebook, x) the written file is measured and, since 4.0.0,
+a usable measurement outside the platform's LUFS / true-peak spec runs
+`loudness.py` on it by default (audio re-encoded, video copied;
+`loudness.normalized: true`), so a platform export is one command instead of
+export, loudness, export again. That pass can still leave the file outside the
+spec (`loudness_outside_spec` beside `normalized: true`), and silent sound is
+not corrected (`silent: true`); `loudness.ok` and `verified` say what was
+achieved. `--no-normalize` keeps 3.x's behaviour: the
+level is measured and only reported, the result's `loudness` (and a `notes`
+line) naming the `loudness.py` call that fixes it; `--normalize` is still accepted. A
 measurement that cannot be read is `loudness.measured: false` (values null) with
 a failing `{step: loudness, ok: false, reason: not_measured}` and a
 `loudness_not_measured` warning, so the export is `verified: false` rather than
-unchecked.
+unchecked. When a platform export returns `loudness`, `normalized: false` means the
+export did not apply a correction pass. The human-readable measurement also states
+whether export applied correction. For a vertical crop, run the Reels,
+TikTok or Shorts preset to reach that platform's explicit frame size.
 
 Subtitle and data streams (a soft-subtitle track muxed upstream, a camera's timecode) are kept
 when the container can hold them: copied as they are, or a text track converted to the

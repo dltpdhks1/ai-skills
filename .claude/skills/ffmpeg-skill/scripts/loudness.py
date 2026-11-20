@@ -73,7 +73,7 @@ def measure(path: str, I: float, tp: float, lra: float) -> dict:
     # FFmpeg measured the track with the default disposition or the most channels, and the gain
     # for that track was applied to a:0 (A110)
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-i", path, "-map", f"0:{PROBED_AUDIO}", "-vn",
-           "-af", f"loudnorm=I={I}:TP={tp}:LRA={lra}:print_format=json", "-f", "null", "-"]
+           "-af", f"aresample=async=1:min_hard_comp=0.01,loudnorm=I={I}:TP={tp}:LRA={lra}:print_format=json", "-f", "null", "-"]
     # Pass 1 is a measurement: it runs under --dry-run too, so the planned pass-2 command and
     # the reported input_i are real (before 1.4.6 a dry run returned a made-up -20 LUFS).
     proc = run_analysis(cmd, check=False, record=True)
@@ -141,10 +141,20 @@ def _normalize(args, meta: dict, stats: dict, lufs: float, tp_max: float, output
     def encode(tp: float, bitrate: str) -> None:
         nonlocal dropped_streams
         af = (
-            f"loudnorm=I={lufs}:TP={tp}:LRA={args.lra}"
+            f"aresample=async=1:min_hard_comp=0.01,loudnorm=I={lufs}:TP={tp}:LRA={args.lra}"
             f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}:measured_LRA={stats['input_lra']}"
             f":measured_thresh={stats['input_thresh']}:offset={stats['target_offset']}:linear=true:print_format=summary"
         )
+        if loudnorm_mode(stats, lufs, tp, args.lra) == "dynamic":
+            # In dynamic mode loudnorm stamps the frames it buffers itself, and they jumped about
+            # 0.1 s after a stretch of digital silence (FFmpeg 6.1) while the samples ran on: every
+            # sound after the jump played 89 ms late against a copied picture, and atrim, which
+            # counts time, cut as much off the end. The samples are restamped in order from the
+            # first one's time (a late start keeps its lead). A gap in the source's sound is
+            # filled with silence before loudnorm (aresample=async=1, both modes; from 10 ms
+            # up, swresample's own threshold of 100 ms left an 80 ms gap closed): the restamp
+            # closed it, and everything after the gap played that much early (review of #636).
+            af += ",asetpts=N/SR/TB+STARTPTS"
         if in_audio:
             af += f",atrim=duration={float(in_audio):.6f}"
         if lead:
@@ -275,7 +285,8 @@ def _versions(args, meta: dict, plan: list) -> int:
         versions.append({"target": label, "output": out, "targets": {"lufs": lufs, "tp": tp, "lra": args.lra},
                          **({"result": doc["result"]} if "result" in doc else {})})
         steps += [dict(st, version=label) for st in doc.get("verification") or []]
-    emit(None, versions=versions, outputs=[v["output"] for v in versions], dropped_non_av_streams=dropped,
+    outputs = [v["output"] for v in versions]
+    emit(None, versions=versions, outputs=outputs, verification_paths=outputs, dropped_non_av_streams=dropped,
          **({"verification": steps} if steps else {}))
     if not STATE.json and not STATE.plan:
         print("\n".join(v["output"] for v in versions))  # one path per line, as a single run prints its one
@@ -286,12 +297,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input")
     ap.add_argument("-o", "--output", help="output file (default: <name>_loudnorm.<ext>)")
-    ap.add_argument("-I", "--lufs", type=float, default=-14.0, help="integrated loudness target in LUFS (default -14)")
-    ap.add_argument("--tp", type=float, default=-1.0, help="true peak ceiling in dBTP (default -1)")
+    ap.add_argument("-I", "--lufs", "--target", type=float, default=-14.0, help="integrated loudness target in LUFS (default -14)")
+    ap.add_argument("--tp", "--true-peak", type=float, default=-1.0, help="true peak ceiling in dBTP (default -1)")
     ap.add_argument("--lra", type=float, default=11.0, help="loudness range target in LU (default 11)")
     ap.add_argument("--measure-only", action="store_true", help="print the measured stats as JSON and exit")
     ap.add_argument("--audio-bitrate", default=None, help="audio bitrate: AAC's in a video container (default 192k), and the codec's of a lossy audio output (.m4a/.aac default 256k, .mp3/.ogg/.opus their own setting); "
-                         "refused for .wav/.flac/.aif/.aiff/.caf. Raised to 256k/320k for AAC only when the encoder overshoots the true-peak ceiling and you did not pin it")
+                         "refused for .wav/.flac/.aif/.aiff/.caf/.mka. Raised to 256k/320k for AAC only when the encoder overshoots the true-peak ceiling and you did not pin it")
     ap.add_argument("--versions", metavar="LIST",
                     help="write one normalised file per target from this master, each measured after: a comma list of "
                          + ", ".join(f"{n} ({i:g} LUFS / {t:g} dBTP)" for n, (i, t) in VERSION_TARGETS.items())

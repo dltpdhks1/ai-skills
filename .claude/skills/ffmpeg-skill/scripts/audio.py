@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from _common.probe import SILENT_PEAK_DBFS
+from _common.runner import path_denied
 from _common import STATE, add_common, dry_run_input_pending, require_tool, apply_common, audio_codec_for, db_to_linear, default_output, die, emit, ffmpeg_base, info, is_audio_output, measured_level_dbfs, probe, run, run_keeping_subtitles, fmt_secs
 from _common.emit import file_origin, stream_end, warn
 from _common.decision import LOSSLESS_AUDIO_EXT, PAD_SOUND_FROM_ZERO, atempo_chain_with_lead, conform_filter, conform_to_length, late_sound_lead
@@ -168,8 +169,8 @@ def preflight_beds(args: argparse.Namespace) -> List[Dict[str, Any]]:
         if dry_run_input_pending(path):
             continue
         reason = None
-        if not os.path.exists(path):
-            reason = "missing"
+        if path_denied(path) or not os.path.exists(path):
+            reason = "permission denied" if path_denied(path) else "missing"
         elif os.path.isdir(path):
             reason = "a directory, not a file"
         elif os.path.getsize(path) == 0:
@@ -334,7 +335,7 @@ def main() -> int:
                             "medium = highpass, de-esser, denoise, gentle compression; strong = medium plus a harder de-esser, a second "
                             "compressor and a soft limiter at -1 dBFS. MCP/JSON callers may still send the 1.12 boolean true, "
                             "which is the bare flag and so means medium")
-    clean.add_argument("--gain", type=float, help="gain in dB applied to the main track")
+    clean.add_argument("--gain", type=float, help="gain in dB applied to the main track, -96..96")
     music = ap.add_argument_group("music")
     music.add_argument("--music", help="music file to mix underneath")
     music.add_argument("--music-volume", type=float, default=-14.0, help="music level in dB relative to full scale (default -14)")
@@ -395,7 +396,7 @@ def main() -> int:
     ap.add_argument("--audio-stream", type=int, default=0, help="which audio stream of the input to process, 0-based in file order (probe lists them under audio_streams)")
     ap.add_argument("--bitrate", default=None,
                     help="audio bitrate: AAC's beside a picture (default 192k), and the codec's of a lossy audio output "
-                         "(.m4a/.aac default 256k, .mp3 -q:a 0, .ogg -q:a 6, .opus 128k); refused for .wav/.flac/.aif/.aiff/.caf")
+                         "(.m4a/.aac default 256k, .mp3 -q:a 0, .ogg -q:a 6, .opus 128k); refused for .wav/.flac/.aif/.aiff/.caf/.mka")
     ap.add_argument("--on-silent", choices=["warn", "fail"], default="warn",
                     help="a --music/--replace/--effects file (or, under --duck, the voice) whose peak is at or below "
                          "--silence-threshold: warn (default: mix it, report it under `silent`) or fail (refuse before ffmpeg runs)")
@@ -431,8 +432,6 @@ def main() -> int:
         die("--denoise is off but --denoise-strength was given; add --denoise"
             + (f" (--voice {args.voice} then denoises at that strength)" if args.voice else ""))
     # afftdn's nf accepts -80..-20 only; 10..19.99 used to pass here and then fail inside ffmpeg.
-    if args.denoise and not 20 <= args.denoise_strength <= 60:
-        die(f"--denoise-strength must be 20..60 (afftdn noise floor in dB below full scale), got {args.denoise_strength:g}")
     for flag, value in (("--fade-in", args.fade_in), ("--fade-out", args.fade_out), ("--music-fade-out", args.music_fade_out)):
         if value < 0:  # a negative length reached afade, which refused it (kind ffmpeg)
             die(f"{flag} must be 0 or more seconds, got {value:g}")
@@ -443,8 +442,6 @@ def main() -> int:
                                 ("--duck-release", args.duck_release, 0.01, 9000.0)):
         if not (lo <= value <= hi):
             die(f"{flag} {value:g} is outside {lo:g}..{hi:g}")
-    if args.stereo_widen is not None and not (0.0 <= args.stereo_widen <= 1.0):
-        die(f"--stereo-widen must be 0..1 (0 = untouched, 1 = maximum), got {args.stereo_widen:g}")
 
     problems = preflight_beds(args)
     silent = find_silent_tracks(args, problems)

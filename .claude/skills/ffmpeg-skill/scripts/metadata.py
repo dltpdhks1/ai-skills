@@ -38,7 +38,7 @@ from _common import (guard_sidecar, add_common, apply_common, default_output, de
 from _common.emit import input_length, refuse_still
 from _common.emit import record_fallback, refuse
 from _common.probe import AUDIO_MEDIA_EXT
-from _common.runner import (MATROSKA_EXT, MP4_FAMILY, carried_stream_maps, fail_if_classified, refuse_output_is_input, require_tool,
+from _common.runner import (absent_word, MATROSKA_EXT, MP4_FAMILY, carried_stream_maps, fail_if_classified, refuse_output_is_input, require_tool,
                             subtitle_codec_for, subtitle_container_holds)
 
 CHAPTER_CONTAINERS = {".mp4", ".m4v", ".m4a", ".mov", ".mkv", ".mka", ".webm"}
@@ -264,7 +264,7 @@ def main() -> int:
                       help="which detector(s) propose the markers (default both)")
     auto.add_argument("--silence-threshold", type=float, default=-35.0,
                       help="silence level in dBFS for --auto-chapters (default -35)")
-    auto.add_argument("--silence-min", type=float, default=1.5,
+    auto.add_argument("--min-silence", "--silence-min", dest="silence_min", type=float, default=1.5,
                       help="a pause must last this long to propose a chapter (default 1.5 -- deliberately longer than silence.py's 0.6: a chapter break is a long pause)")
     auto.add_argument("--scene-threshold", type=float, default=8.0,
                       help="minimum scdet score for a scene cut with --auto-chapters (default 8, as scenes.py)")
@@ -297,7 +297,7 @@ def main() -> int:
     if not args.chapters and not args.clear_chapters and not args.auto_chapters and not tags:
         die("nothing to write: give --chapters FILE, --auto-chapters, --clear-chapters and/or --title/--artist/...")
     if args.chapters and not os.path.exists(args.chapters):
-        die(f"chapters file not found: {args.chapters}")
+        die(f"chapters file {absent_word(args.chapters)}: {args.chapters}")
 
     meta = probe(args.input)
     # streams are copied, so the source's own container always holds them (a .webm stays .webm)

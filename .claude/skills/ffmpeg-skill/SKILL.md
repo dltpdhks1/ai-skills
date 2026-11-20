@@ -8,7 +8,7 @@ description: 'Edit video and audio with local FFmpeg: cut, join, reframe, speed,
 ## Quick start
 
 Run `python3 <skill-dir>/scripts/<name>.py`; the table below routes requests, `--help` lists every flag.
-MCP `tools/list` shows the core 12; the other 30 of the 42 tools stay callable by name.
+MCP lists 12 by default. Set `FFMPEG_SKILL_MCP_TOOLS=probe,cut,fit,export,check` for a smaller editing list. All 42 stay callable by name.
 
 Shared flags (the rest, codec defaults and `--hw`: `references/flags.md`):
 `--dry-run` (plan, write nothing), `--json` (output, probe, commands), `--json-brief` (status + `summary`),
@@ -18,7 +18,7 @@ Writing tools run nothing under `--dry-run`; the measuring tools (`probe`, `chec
 `scenes`, `cropdetect`, `report`, `silence`, `loudness`, `stabilize`, `overlay`, `metadata`, `cut`, `render`,
 `batch`) may still run ffmpeg/ffprobe without writing artifacts; `verify` ignores the flag. Per tool: `contract --json --tool NAME` `dry_run`.
 
-Audio-only files work in the audio tools; picture tools refuse them (`references/workflow.md#audio-only-files`).
+Audio tools accept audio-only files, including Matroska audio (`.mka`). Picture tools require video. See `references/workflow.md#audio-only-files`.
 
 ## Workflow (in this order)
 
@@ -47,8 +47,8 @@ Ask only when the answer changes the output and the request does not imply it; b
 into one proposal ("Reels: 9:16 padded, 60 s, -14 LUFS, no captions — OK?"). Never ask what a probe tells.
 
 - **Destination** sets aspect, length, loudness, codec; "export/post/deliver" with none named: ask.
-- **Duration** without a method: speed for ≤1.5×, else trim; ask for a talk with a large change.
-- **Captions** without text: `--transcribe` if an engine exists, else ask; never invent dialogue.
+- **Duration** without a method: choose what to keep first. Drop dead air (`silence.py`) and unwanted spans, or use `--method trim` for a simple trim. Use `--method speed` when asked to retime. Ask when the intended edit is unclear. A large implicit retime fails with `fit_method_required`.
+- **Captions** without text: `--transcribe --language ja` (name the spoken language; other than English needs a Whisper engine) if an engine exists, else ask; never invent dialogue.
 - **Brand, CJK text, crop position:** `references/workflow.md` (ask/assume section).
 - Anything else: pick the conventional default, say so, offer the alternative in one line.
 
@@ -86,6 +86,8 @@ A failure starts `Failed:` and quotes `error.message`; with nothing to check or 
 These fillers are sentences, not labels: a Japanese report says `Check: 検証するものなし` / `Look: 不要`.
 Never describe a fix you did not run. Full Japanese example and more rules: `references/report.md`.
 
+Report the completed edit first. For standalone use, offer a review page when useful: `python3 scripts/_review.py project.json --result run.json` (a numbered editor screen: press what to change, copy the instruction it writes back to the agent). Prepare it only if the user requests or accepts it. Velisa and other callers that own the review handle their own presentation.
+
 ## Request → script
 
 This table and `doctor --json`'s `tools` are the only tool list (no `doctor.py`, `trim.py`, `subtitle.py`).
@@ -98,7 +100,7 @@ Variants, caveats and extra flags per row: `references/requests.md`.
 | "keep only these parts" | `cut.py in.mp4 --segments 0-1:00,1:30-2:00` |
 | "remove the middle" | `cut.py in.mp4 --remove 1:00-1:30` |
 | "frame-exact but keep the quality" (H.264) | `cut.py in.mp4 --start 1:20.4 --end 2:05.1 --smart` (re-encodes only the partial GOPs; `smart.reason` if it fell back) |
-| "make it exactly 60 seconds" | `fit.py in.mp4 --duration 60` (speed; `--method trim`) |
+| "make it exactly 60 seconds" | Choose what to cut first. For a simple trim, use `fit.py in.mp4 --duration 60 --method trim`. |
 | "cut it and make it HEVC / AV1 / ProRes" | `cut.py in.mp4 --start 0:10 --end 0:40 --codec hevc` |
 | "cut out the pauses", "jump cuts" | `silence.py in.mp4` |
 | "cut the ums and uhs" | `silence.py in.mp4 --filler --words words.json` |
@@ -151,7 +153,7 @@ Variants, caveats and extra flags per row: `references/requests.md`.
 | "just the third mic", "resample to 48 kHz" | `audio.py room.wav --channel 2 --sample-rate 48000 -o mic3.wav` |
 | "compress the voice", "limit the peaks", "gate the noise" | `audio.py in.mp4 --compress` (or `--limit`, `--gate`) |
 | "audiogram", "turn this podcast into a video" | `render.py --template audiogram ep.m4a --image cover.png` |
-| "make this a Reel / TikTok / Short / YouTube" | `render.py --template reels in.mp4 --cues cues.txt` |
+| "make this a Reel / TikTok / Short / YouTube" | `render.py --template reels in.mp4 --cues cues.txt` (platform-sized export; 9:16 alone specifies shape) |
 | "post it everywhere" | `render.py --template all in.mp4 --cues cues.txt` |
 | "export for YouTube / Reels / X", "ProRes / DNxHR / alpha master", "key and fill" | `export.py in.mp4 --preset youtube` (`prores`, `dnxhr-hq`, `prores4444`, `key-fill`) |
 | "under 25 MB" | `export.py in.mp4 --preset youtube --max-mb 25` |
@@ -167,7 +169,7 @@ Variants, caveats and extra flags per row: `references/requests.md`.
 | "grade it but keep the alpha" | `color.py logo.mov --correct --exposure 0.3 --keep-alpha -o graded.mov` |
 | "lower third as a transparent layer" | `background.py --transparent -o canvas.mov --duration 5 --width 1920 --height 1080`, then `graphics.py canvas.mov --template lower-third --name "Ada" --keep-alpha -o lt.mov` |
 | "numbered frames into a video" | `sequence.py --dir frames --pattern "frame_%04d.png" --fps 24` |
-| "waveform video for this track" | `waveform.py ep.wav -o waveform.mp4` |
+| "waveform video" or "waveform at the cut" | `waveform.py ep.wav -o waveform.mp4` or `waveform.py ep.wav --at 12.4 -o cut.png` |
 | "add black at the start" | `pad.py clip.mp4 --start 1.5` |
 | "cut to the product shot", "B-roll over this bit" | `broll.py talk.mp4 --insert product.mp4 --at 12 --end 16 --audio b\|mix` |
 | "add chapters", "set the title / artist" | `metadata.py ep.mp4 --chapters chapters.txt` (`--title`, `--auto-chapters`) |

@@ -26,7 +26,7 @@ The contract is derived from the code that runs, not maintained beside it:
 | Field | Meaning | Changes when |
 |---|---|---|
 | `contract_version` | shape of this document (`2.0`) | a key is renamed, removed or changes meaning |
-| `skill.version` | the npm / package.json version (`3.10.1`) | any release |
+| `skill.version` | the npm / package.json version (`4.2.2`) | any release |
 
 A release that adds a tool or a flag keeps `contract_version`; a breaking change to the
 ToolSpec shape bumps it. Consumers pin on `contract_version` and read `skill.version`
@@ -40,12 +40,26 @@ from `scripts/` on every CI run instead — a stale count fails a test rather th
 silently. (`SKILL.md` was added to that check after its "the 28 scripts" sat stale through
 twelve tool additions while the other three files were correct.)
 
-## Stability guarantee (3.x)
+## Stability guarantee (4.x)
 
 1.0.0 was published on 2026-09-11 (by accident: see CHANGELOG.md's 1.0.0 entry; the number
 is kept rather than burned). From 1.0.3 on, the number is treated as the promise it implies;
-2.0.0 (2026-09-22) is the first deliberate break, listed under "What 2.0 changed" below, and
-3.0.0 is the second, listed under "What 3.0 changed". The same promise holds for the whole of 3.x:
+2.0.0 (2026-09-22) is the first deliberate break, listed under "What 2.0 changed" below,
+3.0.0 the second ("What 3.0 changed") and 4.0.0 the third ("What 4.0 changed").
+
+4.x splits the promise by tool. Each tool's `stability` in `contract --json` says which half it is
+under:
+
+- **`stable`**: the 12 core tools (`render`, `look`, `caption`, `export`, `check`, `fit`, `cut`,
+  `audio`, `loudness`, `graphics`, `silence`, `probe`; the MCP server's default `tools/list`). The
+  table below holds for them for the whole of 4.x, as it held for every tool in 3.x.
+- **`beta`**: the other 30. The same table holds, except that an argument or an output key may be
+  removed, renamed or made required in a minor release after it has been listed in `deprecated`
+  for one minor release (not the three steps below). Tool names and script names are not
+  removed in 4.x.
+
+A beta tool becomes stable in a minor release, with a CHANGELOG line; a stable tool does not
+become beta before 5.0.
 
 | Surface | Promise |
 |---|---|
@@ -146,6 +160,22 @@ JSON would have been rewritten for that. The flat keys, typed per tool in `outpu
 | `cut.py` defaults: `-avoid_negative_ts make_zero` on a single `.mp4`/`.mov` stream copy; x264 for an SDR HEVC source's re-encode; `--vfr-guard average` | decided in 2.x (`docs/design-decisions.md`) | the edit list is kept by default (`edit_list: true`, the picture starts at `--start`); an SDR HEVC source's re-encode stays HEVC; `--vfr-guard` defaults to `sampled`. `--edit-list` and `--keep-hevc` are still accepted | `--no-edit-list`, `--no-keep-hevc` and `--vfr-guard average` restore the 2.x behaviour |
 | `cut.py`'s `precision` and `keyframe_snapped` | decided in 2.x (`docs/design-decisions.md`) | `precision` is the least exact segment's, equal to `least_exact_precision` (which stays); `keyframe_snapped` equals `start_snapped`: a copied start really moved (boolean, or `null` under `--dry-run`). `contract_version` is `2.0` | Read `start_snapped`/`keyframe_snapped` for "did the start move"; a 2.x "stream copy end to end" test is `reencoded: false` |
 
+## What 4.0 changed
+
+Each row was a 3.x behaviour a caller could have relied on, so it waited for a major (#632). None
+removes a tool, a flag or an output key.
+
+| What changed in 4.0.0 | 3.x behaviour | 4.0 behaviour | Migrating from 3.x |
+|---|---|---|---|
+| The promise is split by tool (`stability`) | every tool under the same promise | the 12 core ones `stable`, the other 30 `beta` (see "Stability guarantee (4.x)") | Read `stability` in `contract --json`; pin a version if you depend on a beta tool's arguments |
+| `export.py`, a single-file video delivery (not GIF) that misses a required property: a missing picture or sound stream, the wrong video codec (for an editing master also its profile and pixel format), preset size or fixed frame rate, or a duration or `--max-mb` limit (#620) | exit 0 with `verified: false` | exit 1, `kind: verification`, the failed steps listed and the file kept. A failed loudness step still only sets `verified: false` | Read the exit status (or `status`) for a delivery that misses a required property, and keep reading `verified`: a loudness miss is still exit 0 with `verified: false` |
+| `fit.py --duration` whose implicit speed factor is above 1.15 or below 1/1.15 (#582) | retimed, with `large_speed_change` among the warnings | refused before ffmpeg runs, `error.reason: fit_method_required` (`details: {factor, threshold, source_duration, target_duration}`), dry runs with a known length included | Pass `--method speed` to retime or `--method trim` to trim; `--smooth blend` or `--smooth interpolate` also chooses a retime |
+| Delivery templates (`render.py --template`) (#575) | platform checks only | the template's `check` also runs `check.py --content` (black frames, freezes, flashes, silence, dropouts); a failed row fails the render and keeps the file | Fill the template with `--write-project` and set `"check": {"platform": "...", "content": false}` |
+| `export.py` with a platform preset (`reels`, `youtube`, `x`, ...) on a source that misses the platform's loudness (#579) | delivered as it was, with `loudness.ok: false` and a warning; `--normalize` corrected it | corrected by default (`loudness.normalized: true`) | Pass `--no-normalize` to keep the sound as it is and only report |
+| `join.py --copy` of AAC clips whose sound a copy join would put more than 50 ms behind or ahead of the picture at some clip (#610) | joined, `verified: true`, the sound 32 ms later at every join on the clips measured (10.7 ms earlier per join when each clip's sound is shorter than its picture) | refused before anything is written, `error.reason: join_copy_mismatch` with `details.aac_drift_ms` and each clip's priming and predicted delay | Drop `--copy` (each clip's sound is decoded and trimmed to its picture), or join fewer clips per copy |
+| `caption.py --transcribe` and `silence.py --transcribe` under `--engine auto`, with no language named, none detectable, and only an English-only Parakeet model able to run (no Whisper engine, or every one failed) | transcribed as English, `verified: true`, with a top-level `notes` line and the warning `asr_language_assumed` saying the transcript is wrong if the speech is not English | refused before anything is transcribed or written, `kind: input`, `error.reason: english_only` (`engine_failed` when a Whisper engine ran and failed), `engines[].detail` naming the flag. `asr_language_assumed` and `silence.py`'s `notes` are gone | Name the language (`--language en`, `--filler-lang en`), install a Whisper engine, or give Parakeet a multilingual (v3) model |
+| An input that is empty, a directory, not media, or unreadable by this user; an output extension the build has no muxer for (#558) | ffprobe's raw lines (`kind: input`, no reason), "input not found" for a permission error, and `kind: ffmpeg` after a completed dry run for `out.xyz` | `kind: input` with `error.reason` `input_empty`, `input_is_directory`, `input_not_media`, `input_permission_denied` or `output_extension_unknown`, dry runs included | Match on `error.reason`, not on the message |
+
 ## Skill
 
 ```json
@@ -154,7 +184,7 @@ JSON would have been rewritten for that. The flat keys, typed per tool in `outpu
   "deprecated": [],
   "removed": [{"what": "...", "since": "1.10.0", "replacement": "...", "removed_in": "2.0.0", "where": "cli | json | mcp | behaviour"},
               {"what": "running on FFmpeg 5.x (the requirements.ffmpeg floor)", "since": "2.14.0", "replacement": "FFmpeg 6.1 or later; ...", "removed_in": "3.0.0", "where": "behaviour"}],
-  "skill": {"id": "ffmpeg-skill", "version": "3.10.1", "execution_mode": "local", "kind": "execution",
+  "skill": {"id": "ffmpeg-skill", "version": "4.2.2", "execution_mode": "local", "kind": "execution",
             "entrypoints": {"cli": "...", "mcp": "...", "contract": "...", "doctor": "..."},
             "not_provided": ["AI reasoning", "decisions", "production plans", "project IR", "approvals", "network access", "transcription engine"]},
   "requirements": {"python": ">=3.10 (standard library only)", "ffmpeg": ">=6.1", "ffprobe": ">=6.1"},
@@ -189,12 +219,13 @@ One entry per tool under `tools`, sorted by id. Tool ids are stable:
 | `supports_json` | whether `--json` exists |
 | `supports_json_brief` | whether `--json-brief` exists (1.11.0): the same success document with `probe` replaced by a compact `summary` (`duration_s`, `width`, `height`, `fps`, `vcodec`, `acodec`, `channels`, and `lufs` when the tool measured one), `commands` replaced by the number of commands run, and the per-step `verification` list dropped (its verdict stays in `verified`). Tool-specific keys are unchanged, `--json`'s own output is unchanged, and a failure prints the same failure document either way |
 | `mutates_input` | always `false`: no tool overwrites its input |
+| `stability` | `stable` (the 12 core tools) or `beta` (the other 30); since 4.0.0, see "Stability guarantee (4.x)" |
 | `produces_artifact` | writes a file (media, PNG, HTML, EDL) |
 | `verification` | `{required, tools}`: which tools to run on the output afterwards |
 | `requires_visual_verification` | the picture changed; run `ffmpeg-skill/look` and inspect the PNG |
 | `unverified_properties` | 2.18: the output properties this tool does not measure, the same list its results carry as `unverified` (empty when the tool names none) |
 | `reencodes_video`, `reencodes_audio` | `"always"` / `"never"` / `"conditional"`, meaning *when that stream is present in the input* — not whether the tool touches the file at all. `"conditional"` tools (`cut`, `export`, `render`, `batch`, `verify`, `caption`, `color`, `join`) carry a `reencode_note` explaining what it depends on — for `caption`, `--mode burn` (default) always re-encodes both streams, `--mode mux` copies both untouched; for `color`, `--strip-dovi` and `--retag` are a stream copy of both (retag only re-encodes if the copy attempt fails or ffprobe still reads the old tags on the copy), while `--to-sdr` / `--lut` / `--correct` always re-encode both; for `join`, `--copy --transition none` copies both, every other join re-encodes both. Several visual tools (`fit`, `overlay`, `graphics`, `multicam`, `silence`) are `"always"` on audio too: this codebase never mixes `-c:v` re-encode with `-c:a copy` in one call, so a caller cannot assume the original audio codec survives just because only the picture changed |
-| `audio_only` | accepts an audio-only input (WAV, MP3, M4A, FLAC, OGG, Opus) |
+| `audio_only` | accepts an audio-only input (WAV, MP3, M4A, FLAC, OGG, Opus, MKA) |
 | `video_required` | refuses an input without a video stream ("input has no video stream") |
 | | `scenes` has `audio_only: true` and `video_required: false` after 3.2.0: an audio-only file is one scene, measured by `--beats`, `--audio-peaks`, `--speech` and `--highlights` (result key `audio_only: true`); `--sheet` and `--shots` refuse it. `render` has `audio_only: true` and `video_required: false` since 2.17.4: `--template podcast` and `--template audiogram` take an audio file. `join` has them since 0.9.1: audio-only inputs are joined as audio (no `look` needed then); mixing audio and video inputs is refused |
 | `deterministic_inputs`, `idempotency_hint` | see Repeatability |
@@ -315,7 +346,11 @@ only; `_common.bt709_matrix_filter()`), so the label and the pixels agree. An un
 source adds no filter, and the tags themselves never convert (`bt709_tag_args()`). An RGB picture
 (a PNG or JPEG still, a PNG sequence, a qtrle clip, an `overlay --image` logo, an emoji PNG,
 `waveform --image`) is converted to BT.709 YUV explicitly (`scale=out_color_matrix=bt709`; a JPEG is
-a `bt470bg` source); `grid.py` converts each cell by its own tags. Where a converted picture meets an
+a `bt470bg` source); `grid.py` converts each cell by its own tags. An RGB source that probes HDR
+or BT.2020 keeps the 10-bit line, and its YUV is made with the matrix that line tags
+(`scale=out_color_matrix=bt2020`, tagged `bt2020nc`; `_common.color.hdr_rgb_matrix_filter()`, #544);
+an 8-bit BT.709 line given such a source (an `export.py` fixed preset, `grid.py`) and an alpha line
+do not convert it. Where a converted picture meets an
 untagged one in a mixing filter, the untagged one is labelled BT.709 (`setparams`, tags only), so
 FFmpeg 7.1+'s colourspace negotiation converts neither (`join`, `multicam`, `broll` and `overlay --video`
 too, beside a converted clip). A colour a tool draws from a hex or named value (a pad, `tpad` or
@@ -346,8 +381,9 @@ asks for the CPU and gets what ffmpeg says about it. What ran is in the result's
 "tool", "argv", "cwd", "inputs": [{"path", "size", "sha256_head_tail"}], "commands",
 "unbound_inputs", "output", "verify": [{"tool": "probe"}, {"tool": "check", "platform"}], "notes"}`. It
 implies `--dry-run`, so the same execution rules apply; `inputs` covers the `-i` files of the
-planned commands, every existing file named in argv (a recipe, a still, an SRT) and the
-subtitle/LUT/font files a filter reads; `unbound_inputs` (absolute paths, additive to version 1)
+planned commands, existing file arguments and the media, text, JSON, subtitle, LUT or font
+inputs the tool registers as it reads them. Both `--flag FILE` and `--flag=FILE` bind the same
+registered input. `unbound_inputs` (absolute paths, additive to version 1)
 names the inputs that did not exist yet when the plan was made (an earlier step's output), which
 therefore carry no fingerprint. Tools that print their document without `--json`
 (`probe`, the analysis tools) still write the plan at exit; `verify.py` and `render.py`
@@ -360,7 +396,23 @@ tool, a vanished `cwd` or a malformed `argv` is refused the same way under its o
 runs the tool with the planned `argv`, then the verify steps (a `check` step may also carry
 `"content": true`, added by hand, for `check.py --content`), and reports `plan`, `plan_sha256`,
 `tool`, `tool_result`, `check` and `unbound_inputs` (each one also a `diagnostics.warnings` entry:
-nothing checked that file). `plan_version` is bumped when the document's shape changes.
+nothing checked that file). `plan_version` is bumped when the execution document's shape changes.
+
+With `fit.py --duration`, dry-run JSON, saved plans and completed results include a `timing`
+object with `method`, `source_duration`, `target_duration`, `speed_factor` and `retimed`. Durations
+are in seconds. The speed factor is the computed source/target ratio for `speed`, and 1 for
+`trim`. `retimed` says whether the command includes a speed change. A ratio within 0.0001 of 1
+leaves the speed unchanged. A dry run without a usable input length reports a null source
+duration, factor and retime decision for `speed`. Saving a plan checks that its input still
+matches the fingerprint taken before measuring it. Plan execution uses `argv` and measures
+the output duration separately.
+
+New `sequence` plans add a complete-file `sha256_full` fingerprint for each selected frame
+in `inputs`. The additive `sequence_frames_sha256` field binds their order and contents.
+The tool checks the same fingerprints again before saving the plan. Replay, including replay with
+`--dry-run`, refuses a changed selection as `plan_inputs_changed`. For printf patterns the
+selection ends at the first gap. Older plans without the field still run and warn
+with `plan_sequence_unbound`; regenerate the plan to check the selection.
 
 ### Repeatability
 
@@ -472,7 +524,33 @@ which fills a `templates/<name>.json` project shipped with the skill. `--templat
 comma-separated list renders every named destination and writes a `<stem>_pack.md` table.
 A project may now carry `"template"` (the name it was filled from) and `"frame": {"fit": ...}`.
 
+Shipped delivery templates set `check.content: true`. When the render reaches the check stage,
+it runs `check.py --content`
+on the written file in addition to its platform checks. Content rows only apply to present
+streams. A FAIL verdict keeps the written file and returns `kind: verification` with the check
+report. A template dry run that reaches the check stage reports `check_dry_run` and leaves
+`check` null. To run only the
+platform checks, use `--write-project` and set `check.content` to false before rendering.
+When retrying after a failed content check, choose a new output or pass `--overwrite`
+to intentionally replace the retained file.
+Ordinary projects still enable content checks with their own `check.content` setting.
+
+A `fit.py --aspect 9:16 --fit crop` result uses source-derived dimensions unless
+width or height was requested. The Reels preset delivers 1080×1920. When a platform export returns
+`loudness`, `loudness.normalized` records whether export ran the correction pass,
+and `loudness.ok` records whether the delivered audio meets the target. An unreadable or
+too-short reading has `loudness.ok: null`. A silent track is reported with `silent: true`
+and receives no correction.
+
 ## Capabilities
+
+`doctor --json` reports `fonts.scripts.vi` separately for Vietnamese. Its
+`available`/ `missing`/ `unknown` status reflects a fontconfig Vietnamese
+coverage match or a known Windows font. Caption font selection uses that lookup
+for Latin cues marked `--lang vi` or containing common Vietnamese diacritics.
+For an explicit family, the coverage diagnostic uses the selected regular or
+bold face when it can be identified, including its index in a font collection.
+If the selected face cannot be checked, the result records `font_coverage_unverified`.
 
 Names: `ffmpeg`, `ffprobe`, `encoder:<name>`, `decoder:<name>`, `filter:<name>`, `bsf:<name>`,
 `external:whisper`, `external:parakeet`. `capabilities.required` is the union of every tool's required list;
@@ -506,10 +584,12 @@ model; without it `FFMPEG_SKILL_ASR_MODEL` is this machine's default, else `base
 engines only, and the Whisper engines keep `base`. `doctor` reports neither variable (it prints no
 environment values); the result's `transcription.model` names the model that ran. When no `--language` is given
 and no detector can name it, a Whisper engine that can run takes it (whisper.cpp is passed
-`-l auto`: its own default is English). Parakeet then runs only on English *assumed* -- when no
-Whisper engine is installed, or every one failed, or `--model` names an English-only Parakeet
-model -- and the result's top-level `notes` says the transcript is wrong if the speech is not
-English; a multilingual (v3) Parakeet model assumes nothing and gets no note. Every whisper.cpp
+`-l auto`: its own default is English). When no Whisper engine can take it
+(none is installed, every one failed, or `--model` names a Parakeet model), an English-only
+Parakeet model is not run on speech nobody named (4.0.0): the call is refused before anything is
+transcribed or written (`error.reason: english_only`, or `engine_failed` when a Whisper engine ran
+and failed; `engines[].detail` names the flag, `--language` or `--filler-lang`). A multilingual
+(v3) Parakeet model assumes nothing and runs. Every whisper.cpp
 command that writes a transcript is also passed `-mc 0` (no previous-text context, so one
 hallucinated line is not repeated to the end of the file); its language detection is not. The result's
 `transcription` says which engine, model and routing decision produced the cues (in every
@@ -580,6 +660,12 @@ keg-only `opt/ffmpeg-full/bin/<name>`, the tools run that one (#317), because `b
 ffmpeg-full` does not put it on PATH and the lean build has no drawtext/subtitles/zscale. Nothing
 else is substituted. `ffmpeg` and `ffprobe` (version strings) keep their meaning; the four keys are
 additive.
+
+`doctor` reports the selected FFmpeg executable's build license under `ffmpeg_license` in JSON
+and in the human-readable report. It reads the executable's `-L` notice locally with a 10-second
+timeout. The field is an SPDX identifier for a recognized GPL or LGPL notice, `"nonfree"` for
+FFmpeg's nonfree build notice, or `null` when the binary or its notice could not be read or
+recognized. The result is informational and leaves capability decisions and the exit code unchanged.
 
 `doctor`'s `ffmpeg_security` field compares the `ffmpeg` and `ffprobe` versions with a small table of
 high-severity FFmpeg CVEs and the first upstream release on each branch that carries the fix. The table is
@@ -700,6 +786,17 @@ runs a shell, evaluates strings, or executes anything other than the named scrip
 
 ## JSON output
 
+The common result writer computes `verified` from the output probe or an equivalent
+artifact check and requires every verification step to pass. `lossless` is true
+only when a successful FFmpeg stream-copy write can be traced to the current
+output and the run recorded no re-encode. Stream copy can still trim the timeline,
+change metadata or drop tracks.
+
+Under `--dry-run`, both flags are false. Top-level output measurements such as
+`output_duration`, width and height are absent or null until measured. Timing
+targets such as `expected_duration` and measurements of existing inputs remain available.
+`probe.py` reports null for facts about a pending input.
+
 Non-finite numbers never reach a `--json` document (2.2.6): every tool prints through one
 writer that turns `-inf` / `inf` into the strings `"-inf"` / `"inf"` (the spelling
 `loudness.py` already used for a silent input) and NaN into `null`, then serialises with
@@ -743,7 +840,8 @@ given a different type):
 | `caption` | `caption.py` | the cue-layout counts the run only printed before (`shifted`, `wrapped`, `rebalanced`, `split`, `extended`, `dropped`) plus `wrap` (`"phrase"` or `"measured"`) and `phrase_breaks`, the number of cues a phrase rule broke somewhere the 1.15 width rule would not. `broken_inside_word` (1.18.4) counts atoms hard-sliced at the live column's edge because they did not fit alone even at the size floor — never a rewrite, the sliced pieces are the exact original characters. `overlong` is now residual: it fires only when even a single character is wider than the column |
 | `tracks`, `subtitle_tracks` | `caption.py --mode mux` | one entry per subtitle stream in the output — `{index, file, language, title, codec, default, cues, kept_from_input}`; a stream the input already carried has `file: null` and `kept_from_input: true`. `subtitle_tracks` is the total. Every field describes the file as written, not as asked for: an MPEG-4 output reports `title: null` (the muxer stores none) and `default: true` on its first track (the muxer always enables it), each with a `notes` line |
 | `auto_chapters` | `metadata.py --auto-chapters` | `{source, min_chapter, max_chapters, proposed, kept, titles, chapters, description_block, files}`. `titles` is always `"placeholder"`: the machine-readable form of "the skill did not name these". Each chapter carries its `evidence` (`start`, `silence`, `scene`, or `silence+scene` with the span, its length and the cut time) |
-| `audiogram` | `waveform.py` (every run) | `{style, background, image, position, vis_height, platform, captions, title, stages, verified}`. `background` is `"image"` or `"color"`; `verified` is true when the render probes at the asked-for frame size, frame rate and within 0.05 s of the source audio, and is `false` under `--dry-run`, where nothing was rendered to verify |
+| `audiogram` | `waveform.py` (video mode) | `{style, background, image, position, vis_height, platform, captions, title, stages, verified}`. `background` is `"image"` or `"color"`; `verified` is true when the render probes at the asked-for frame size, frame rate and within 0.05 s of the source audio, and is `false` under `--dry-run`, where nothing was rendered to verify |
+| `waveforms`, `planned_waveforms` | `waveform.py --at` | One row per requested PNG, `{output, time, start, end, window_seconds, marker_x}`. Times are on the input's clock. A dry run uses `planned_waveforms` with `verified: false`. A real run lists `waveforms` and checks each PNG's codec and dimensions under `verification`. |
 
 Per-tool keys added in 1.17, all additive:
 
@@ -788,10 +886,9 @@ Per-tool keys added after 2.2.2, all additive:
 | `sdr_path`, `notes` | `color.py --to-sdr` | `sdr_path` is `"tonemap"` for PQ / HLG / Dolby Vision input (and `--force` on an untagged file) or `"gamut"` for BT.2020 primaries on an SDR transfer, which is converted to BT.709 without a tone map (`--tonemap`/`--peak`/`--desat` do not apply); `notes` says which path was taken and why |
 | `silent` | `join.py` (every run) | `[{index, path, peak_db, at, end}]`: inputs whose whole-file audio peak (volumedetect) is at or below `--silence-threshold` (default -50 dBFS) and that `--on-silent warn` (default) joined anyway, with a `notes` line; `at`/`end` are where the input sits in the output, in seconds (a transition overlaps its neighbours). An input named by `--allow-silent N[,N]` (1-based) is a planned pause: always joined, listed with `intended: true`, no warning or note, whatever `--on-silent` says. `[]` otherwise. `--on-silent fail` names them in the `kind: input` refusal's `problems` (reason `silent (peak -91.0 dBFS)`), `skip` lists them under `skipped`. An input with no audio stream is never silent; `verified` is unaffected |
 | `short_segments`, `duplicates` | `join.py` (every run) | warnings, never refusals, and the join command is unchanged: `short_segments: [{index, path, duration}]` names each measured input shorter than 2 frames at the join's fps (an audio-only join: shorter than 0.05 s); `duplicates: [{path, indices}]` names a path (compared resolved) listed more than once — repeating a clip can be intended. `[]` when none; each non-empty one adds a `notes` line |
-| `silent` | `waveform.py` (every run) | `true` when the input audio's whole-file peak is at or below `--silence-threshold` (default -50 dBFS), which draws a flat line; `--on-silent warn` (default) renders it anyway with a `notes` line, `fail` refuses (`kind: input`) before ffmpeg runs. `false` when audible, `null` under `--dry-run` (nothing measured). `verified` is unaffected |
+| `silent` | `waveform.py` (video mode) | `true` when the input audio's whole-file peak is at or below `--silence-threshold` (default -50 dBFS), which draws a flat line; `--on-silent warn` (default) renders it anyway with a `notes` line, `fail` refuses (`kind: input`) before ffmpeg runs. `false` when audible, `null` under `--dry-run` (nothing measured). `verified` is unaffected |
 | `encoder`, `hw`, `notes` | every re-encoding tool, `export.py`, `render.py`, `batch.py` (and its rows), `waveform.py` | `encoder`: the video encoder the last command ran (after any GPU→CPU fallback; under `--dry-run`, the planned one), `copy` for a stream copy; absent when no command encoded video. A tool that runs other tools reports its stages': `render.py` its stages and an executed plan's tool, `waveform.py` the title/caption stage that writes its file (its `commands` include that stage's). `hw` is present when VideoToolbox was asked for (`--hw`, `FFMPEG_SKILL_HW=1`, or a stage or `batch.py` item that reported it), on `export.py` when `FFMPEG_SKILL_HW=1` is set but its delivery preset does not take it, and when an encode ran on VideoToolbox because the build has no `libx264`/`libx265`: `{requested, source: flag\|env\|auto, used, fallback, notes}`. `requested` says whether this run's encodes were asked onto VideoToolbox (`false` for that export, and for `source: "auto"`, where nobody asked: `notes` names the missing CPU encoder and the one that ran, and `--no-hw` is not offered as a remedy since there is no CPU encoder to go back to; a job VideoToolbox refuses there is a plain `kind: ffmpeg` failure, not retried), `used` whether the encoder that ran last is VideoToolbox (`null` under `--dry-run`, which ran nothing, and when the tool encoded nothing itself: `batch.py`, whose top-level `hw` gathers its items' `requested`/`source`/`fallback`/`notes` while each `results` row carries the item's own `encoder`, and `hw`/`notes` when VideoToolbox was asked for), `fallback` whether a job VideoToolbox refused was re-encoded on the CPU, and `notes` why. Only a VideoToolbox failure (the encoder could not open, or its compression session failed) is retried on the CPU; any other failure is reported as it happened, once. Every VideoToolbox encode adds a top-level `notes` line: its quality is not CRF-equivalent (`--quality` / a preset's CRF maps to `-q:v` approximately), and `verified` stays what it is for every tool, the measured properties of the output. A `kind: ffmpeg` failure under `--hw` / `FFMPEG_SKILL_HW` carries `encoder` and `hw` for the command that ran last (a stage's, when `render.py`/`waveform.py` re-raise it); when the command itself failed inside the run (not a tool's own check afterwards, such as `cut.py`'s), its message also names that encoder |
 | `transcription` | `caption.py --transcribe` (every `--mode`); inside `filler` for `silence.py --filler --transcribe` | `{routing, detected_language?, engine, model, language}`: the engine and model that made the transcript; `language` is the language the engine was told -- the one named (`--language`, `--filler-lang`), else the one auto's detector named -- and, when nothing was named, the language the engine decoded where it reports one (whisper.cpp's word-timing JSON, faster-whisper, openai-whisper's word-timing JSON), else `null`; `detected_language` is present when auto's whisper.cpp detector named one; `routing` says why `--engine auto` chose the engine (`"requested"` for a named engine), ending `, no Parakeet engine transcribed it` when auto chose Parakeet and a Whisper engine made the transcript after every Parakeet engine failed |
-| `notes` | `silence.py --transcribe` with `--filler` or a sentence flag (new for `silence.py`; `caption.py` already had it) | present when `--engine auto` ran the English-only Parakeet model on English *assumed* (no language given or detectable, and no Whisper engine installed or none that succeeded): the transcript is wrong if the speech is not English. `caption.py --transcribe` puts the same line in its `notes` |
 | `reencode_reason`, `segment_precision`, `least_exact_precision`, `start_snapped` | `cut.py` (every run) | `reencode_reason`: why anything was re-encoded, distinct values in first-seen order, `[]` for a clean copy: `requested` (`--accurate`), `codec` (`--codec`), `vfr`, `vfr_inconclusive`, `pcm_container`, `copy_failed`, `stream_lost` (the copy wrote no video or no audio: an MPEG-TS copy whose window holds no video keyframe, #367), `tolerance`, `concat_fallback` (a `--segments` join that could not stay a stream copy, which now also sets `reencoded: true` and `mode: hybrid`; it reported `copy` before). `segment_precision`: each `--segments` segment's precision (`null` for one segment); `least_exact_precision`: the least exact of them, on every run. Since 3.0.0 `precision` is the least exact segment's, equal to `least_exact_precision`, and `keyframe_snapped` equals `start_snapped` (2.x: `precision` was the whole run's, `packet` only when nothing re-encoded, and `keyframe_snapped` was `precision == "packet"`, a stream copy end to end; see "What 3.0 changed"). `start_snapped`: measured, `true` when a copied segment's picture starts more than one frame from its requested start (or its start could not be measured: an unknown start is never claimed exact), `false` when every start is where asked or everything re-encoded, `null` under `--dry-run`. `requested_segments`/`requested_duration` keep their meaning, the request clamped to the media's duration: a segment ended with the video (less than a frame of sound trimmed) shows in `duration_delta_seconds` and a `notes` line |
 | `caption_srt` | `render.py` | the SRT the captions stage generated from a `captions.text` cue file, delivered as `<output>.srt` beside the output and guarded with it before the first stage (an existing one is refused without `--overwrite`, an input is never replaced); the planned path under `--dry-run`; `null` with no such stage, captions from `srt`/`ass`, `--stop-after` before the export, or when it was not delivered: a `caption_srt_not_delivered` skip says why (`cached`: the stage came from `--cache`, which keeps its video only; `timeline_changed`: the export trimmed the delivery, so the cue times are not its own) (#510) |
 | `kept` | `batch.py` `results` rows | an item stopped by Ctrl-C/SIGTERM while its last step ran, when that step had already written a file at the final path that was not there when it started (`export.py --normalize` keeps its encode during the loudness pass): the path, on disk and unverified. `render.py` reports the same in its failure document's `output` and message: a stage that writes the delivery is watched (size, mtime, inode before it starts), and a file it left there is kept, while one it did not change is not claimed (#510) |
@@ -868,6 +965,7 @@ Keys added after 3.1.8, additive (delivery masters and versions, #417-#423):
 | `versions`, `outputs` | `loudness.py --versions` | one row per target `{target, output, targets, result}` (top-level `output` is null) and the files written; each version's `loudness` and `duration` steps carry `version`, and `verified` holds only when every version met its own target. An empty list is refused; a `--plan` path that is one of the version files is refused (`output_path_taken`) |
 | `crossfade`, `expected_duration`, `seam` | `loop.py` | `crossfade`: the fade in seconds, whole frames; `expected_duration`: the length asked for, checked by the `duration` step within 1.5 frames; `seam`: the first seam measured (`video_step` against `video_typical_step`, `audio_level_step_db`) |
 | `guides` | `look.py --guides` | each outline drawn on the PNG (`action` 0.93, `title` 0.90 of the frame, or the `4:3` centre cut with its own); a frame (either clip under `--compare`) no wider than 4:3 refuses `4:3` |
+| `comparisons` | `look.py --compare` | One `{output, input_seek, compare_seek}` row per PNG, with requested positions in seconds on each input's clock. Repeat `--compare-at` once per `--at` to give the right side separate times. Otherwise both sides use `--at`. A dry run reports the planned image paths and seeks. The tool leaves the visual match to the reviewer. |
 | `levels`; row `legal levels` | `check.py --levels bt709\|ebu-r103` | `{standard, reference, bit_depth, legal {y, c}, window_seconds, frames, out_of_range_pct {y, u, v, chroma}, brng_pct, worst_frame {time, y_pct, chroma_pct}, min {y, u, v}, max {y, u, v}, windows [{start, end, ...the same}]}`: `legal` is the inclusive code range at the file's bit depth, the shares are percentages of samples (chroma: Cb and Cr together, at their own resolution), counted exactly per frame, and `brng_pct` is signalstats' BRNG (pixels with any component outside the fixed nominal range) |
 | `legalize`; step `legal_levels` | `color.py --legalize bt709\|ebu-r103` (with `--to-sdr`, `--lut` or `--correct`) | `{standard, reference, legal, output}`: `output` is the `levels` document of the written file; the step fails (`verified: false`, status `completed`) when one frame keeps more than 1 % of its luma or chroma samples out of range after the encode, with a `legalize_residual` warning whenever any sample is out |
 | `smart`; `mode` `smart`; `reencode_reason` `smart` / `smart_fallback`; steps `smart_frames`, `smart_packets`, `smart_decode`, `smart_params` | `cut.py --smart` | `{applied, parts [{segment, kind: reencode\|copy, start, end, frames}], reencoded_frames, copied_frames, matched, encoder, checks {frames, grid_worst_seconds, copied_packets_equal, frames_decoded_equal, time_base}, time_base}`: only the partial GOPs at the cut points are re-encoded (libx264 matched to the source's profile, level, pixel format, reorder depth, size, SAR and colour tags), the rest is the source's packets, and the output is checked against the source before it is moved into place. When it cannot be made or does not verify: `{applied: false, reason, reason_code}`, `mode: accurate`, the whole cut re-encoded |
@@ -878,6 +976,27 @@ Keys added after 3.8.20, additive (#519):
 | key | tool | what it holds |
 |---|---|---|
 | `picture` | `fit.py` with `--aspect`, `--width` or `--height` (not under `--dry-run`) | where the picture sits in the frame written, measured, not judged: `{measured, x, y, width, height, frame_width, frame_height, frame_share, scale, cropped {left, right, top, bottom}}`. ffmpeg runs the frame's own filters (the scale and pad, the blur graph with its background drawn black, or the scale and crop) on one white and one black frame of the source's displayed size and pixel format, ending in the written file's pixel format, and the picture is the rectangle where the two differ; no frame of the source is decoded, and `frame_width`/`frame_height` are the written file's. `frame_share`: the picture's area over the frame's (1.0 for `--fit crop`). `scale`: the picture's width over the source's displayed width (for `--fit crop`, the width it was scaled to before the crop), with a note when it is below 1 and no `--width`/`--height` was given. `cropped`: source pixels `--fit crop` cut on each side, each axis at its own scale (all 0 otherwise). `{measured: false, reason}` and a note when the measurement gave no frame of the written size. `subject_framing` stays in `unverified`: whether the subject is in the rectangle is still a look |
+
+`export.py` emits the same `picture` object when a real export scales into a preset's fixed width and
+height. `render.py` carries the fit and export reports in `stage_pictures` keyed by stage and exposes
+the last sizing stage's report as `picture` when available. Each report's crop margins refer to that
+stage's input. A cache entry replays geometry when it recorded a report. Dry runs omit both fields.
+For these export and render results, `unverified` still includes `picture_content` and `subject_framing`.
+
+`fit.py --fit crop` also reports `crop_check` after writing a crop with a discarded
+margin. Its `basis` is `luma_motion_proxy`. The `verdict` is `ok`, `review`, or
+`unmeasured`. The verdict is `review` when the aggregate or an individual sampled
+point crosses the motion or detail threshold. The `crop_content_off_centre` warning
+includes the affected axis, suggested anchor and `review_points`. `kept.start` and
+`kept.end` are fractions of the displayed source along that axis.
+
+Each `review_points` entry has `source_time` (the sample seek time in seconds),
+`output_time_estimate` (the corresponding seek after trimming and retiming, or
+`null` when the output frame rate or length is uncertain or the seek would fall after
+the last frame's start), `signal` (`motion` or `detail`),
+`motion_outside`, `detail_outside`, `centroid` and `suggested_anchor`. The times
+are review positions for `look.py --at`. A sampling timeout counts as `unmeasured`.
+`subject_framing` remains in `unverified`.
 
 Keys added for the alpha path beyond `export.py` (additive; the `alpha` step on an alpha source without `--keep-alpha` is the one change to an existing run, see below):
 
@@ -968,7 +1087,9 @@ before, and, when `--json` was given, on stdout:
 {"status": "failed", "exit_code": 1,
  "error": {"kind": "input | ffmpeg | output | missing_tool | timeout | verification | interrupted", "message": "...",
            "code": "INPUT_INVALID | DEPENDENCY_MISSING | FFMPEG_EXECUTION_FAILED | OUTPUT_INVALID | TIMEOUT | VERIFICATION_FAILED | INTERNAL_ERROR",
-           "retryable": false},
+           "retryable": false,
+           "hint": "optional: what to change", "reason": "optional, on a refusal: a code from error_reasons",
+           "details": {"path": "optional, with reason: the facts the message is written from"}},
  "commands": ["ffmpeg ..."]}
 ```
 
@@ -984,12 +1105,29 @@ strings. `retryable` is currently always `false`: none of the kinds are distingu
 today from a deterministic failure that would fail identically on a blind retry, so nothing
 here claims otherwise until real exit-code/stderr sniffing exists to back that up.
 
+For single-file video delivery presets other than GIF, `export.py` exits nonzero if an
+expected A/V stream is missing or the expected video codec (for an editing master also its
+profile and pixel format), enabled preset dimensions, fixed
+preset fps, preset duration cap or `--max-mb` limit fails verification. The JSON result reports
+`kind: verification`, `verified: false`, the retained file and the failed steps. Plain mode
+reports the error on stderr. A failed loudness step is advisory for export and sets
+`verified: false` in JSON. Dry runs finish without post-export assertions.
+
+`fit.py --duration` refuses an implicit speed factor above 1.15 or below 1/1.15
+with `error.reason: fit_method_required`. Choose `--method speed` to retime or
+`--method trim` to trim. For stretching, `--smooth blend` and `--smooth interpolate`
+also express a choice to retime. A large retime that proceeds reports
+`large_speed_change` in `diagnostics.warnings`. The warning and refusal details
+carry `factor`, `threshold`, `source_duration` and `target_duration` (seconds).
+These rules also apply to dry runs with a known source duration. A pending source
+is checked when its duration can be read.
+
 A refusal also carries `error.reason`, a stable snake_case code for *why*
 (`contract --json` → `json_output.error_reasons` lists them: `output_exists`, `output_is_input`,
 `output_is_directory`, `output_dir_missing`, `output_dir_not_writable`, `output_locked`,
 `output_container_codecs` (a `.webm` output for an H.264/HEVC or AAC encode, which WebM cannot hold),
 `media_path_is_url` (`subfile,...:` included), `media_path_is_playlist` (an HLS, DASH, IMF or ffconcat playlist given as media, DASH and IMF told by content whatever the file is called), `media_path_has_line_break` (a path with a line break, which a concat list cannot hold),
-`output_looks_like_option` (an output starting with `-`, other than `-` for stdout), `output_extension_missing` (a media output with no file extension, which leaves ffmpeg no container to choose), `output_extension_unsupported` (a `.wma` output the run would encode into; `.wma` is written only as a stream copy of WMA sound), `output_extension_audio_only` (an audio-only extension such as `.wav` or `.m4a` for a run that writes a picture), `output_path_taken` (two files one run writes share a path), `media_path_not_a_file` (a FIFO or device as input), `still_unreadable` (a file with an image name that ffmpeg cannot decode as one; for `sequence.py`, a frame of the sequence that does not decode, when its decode check completes; when the check cannot be made a note says so and the encode runs), `silence.py --timemap`'s `timemap_path_taken`, `join.py --copy`'s `join_copy_mismatch`,
+`output_looks_like_option` (an output starting with `-`, other than `-` for stdout), `output_extension_missing` (a media output with no file extension, which leaves ffmpeg no container to choose), `output_extension_unknown` (a media output whose extension this ffmpeg build maps to no muxer, such as `out.xyz`, with no `-f`), `output_extension_unsupported` (a `.wma` output the run would encode into; `.wma` is written only as a stream copy of WMA sound), `output_extension_audio_only` (an audio-only extension such as `.wav` or `.m4a` for a run that writes a picture), `output_path_taken` (two files one run writes share a path), `media_path_not_a_file` (a FIFO or device as input), `input_is_directory`, `input_empty` (0 bytes), `input_not_media` (ffprobe cannot read it as media) and `input_permission_denied` (the file, or a directory on the way to it, is not readable by the user; a path that is not there stays "input not found"), `still_unreadable` (a file with an image name that ffmpeg cannot decode as one; for `sequence.py`, a frame of the sequence that does not decode, when its decode check completes; when the check cannot be made a note says so and the encode runs), `silence.py --timemap`'s `timemap_path_taken`, `join.py --copy`'s `join_copy_mismatch`,
 `render.py`'s `plan_*` reasons, `--codec av1`/`prores`'s `encoder_missing` and
 `encoder_list_unreadable`, and `--transcribe`'s `asr_engine_missing`, `no_speech`, `engine_failed`
 and `english_only`), and `error.details`, the facts the message is written from, so a
@@ -1115,6 +1253,14 @@ public script, a removed one, or a changed parser therefore changes the MCP surf
 with no edit to `mcp/`; `tests/test_contract.py` proves this by copying the skill,
 adding, removing and editing scripts, and reading `tools/list` again.
 
+A `tools/call` request can opt in with `params._meta.progressToken` (string or
+integer). `notifications/progress` echoes the token and carries a strictly
+increasing notification count as `progress`. Its `message` reports the current
+FFmpeg step's percent and estimated time remaining when the step knows its
+duration, or media seconds processed otherwise. Each step has its own clock, so
+the server omits an overall `total`. Updates arrive before the final response,
+at most twice a second. Dry runs and calls without a token have no updates.
+
 ### Translation, and what JSON Schema cannot say
 
 | ToolSpec.input_schema | MCP inputSchema |
@@ -1168,6 +1314,13 @@ most often across the corpus in `evals/agent_prompts*.json`. Every tool -- inclu
 contract (`ffmpeg-skill contract --json`) still describes all 42 unconditionally. Set
 `FFMPEG_SKILL_MCP_FULL=1` (anything but "" or `0`) in the server's environment to make `tools/list`
 return all 42, as every version before 1.18.3 did.
+
+Set `FFMPEG_SKILL_MCP_TOOLS=probe,cut,fit,export,check` to advertise a named subset.
+The server trims whitespace, ignores duplicate names and preserves contract order.
+A blank value uses the default list. An unknown name or a nonblank list with no names
+returns a `tools/list` error naming the setting. The full-catalogue setting takes
+precedence. The same selection applies to `mcp/server.py --list`, which exits 2 for an
+invalid selection. `tools/call` and `prompts/list` keep their existing behavior.
 
 ### `prompts` capability: five workflow recipes
 

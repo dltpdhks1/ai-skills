@@ -15,7 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 
 INSTALL_HINTS = {
@@ -33,6 +33,9 @@ INSTALL_HINTS = {
         "  or download a build from https://ffmpeg.org/download.html and add it to PATH"
     ),
 }
+
+MCP_PROGRESS_ENV = "FFMPEG_SKILL_MCP_PROGRESS"
+_PROGRESS_PREFIX = "[ffmpeg-skill progress] "
 
 # For an FFmpeg that is on PATH but older than MIN_FFMPEG (#467 A226): reinstalling the
 # distribution's package gives the same old version back (Ubuntu 22.04's is 4.4, Debian 12's 5.1),
@@ -145,6 +148,12 @@ def _probe_limit() -> float:
     return min(PROBE_TIMEOUT, STATE.timeout) if STATE.timeout else PROBE_TIMEOUT
 
 
+def _ffprobe(*args: str) -> "subprocess.CompletedProcess[str]":
+    # every short ffprobe question this module asks: text out, stderr dropped, the probe time limit
+    return subprocess.run([found_exe("ffprobe"), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                          encoding="utf-8", errors="replace", timeout=_probe_limit())
+
+
 def ffmpeg_version() -> "Tuple[int, int]":
     """(major, minor) of the FFmpeg build on PATH, parsed once from `ffprobe -version`; (0, 0)
     when it cannot be read. ffprobe rather than ffmpeg because --dry-run promises never to run
@@ -156,8 +165,7 @@ def ffmpeg_version() -> "Tuple[int, int]":
     if _FFMPEG_VERSION is None:
         _FFMPEG_VERSION = (0, 0)
         try:
-            out = subprocess.run([found_exe("ffprobe"), "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                 timeout=_probe_limit()).stdout
+            out = _ffprobe("-version").stdout
             m = re.search(r"ffprobe version\s+n?(\d+)\.(\d+)", out)
             if m:
                 _FFMPEG_VERSION = (int(m.group(1)), int(m.group(2)))
@@ -194,8 +202,7 @@ def ffmpeg_release() -> "Optional[Tuple[int, int, int]]":
     if not _FFMPEG_RELEASE_READ:
         _FFMPEG_RELEASE_READ = True
         try:
-            out = subprocess.run([found_exe("ffprobe"), "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                                 timeout=_probe_limit()).stdout
+            out = _ffprobe("-version").stdout
             m = re.search(r"ffprobe version\s+n?(\d+)\.(\d+)(?:\.(\d+))?", out)
             if m:
                 _FFMPEG_RELEASE = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
@@ -360,10 +367,12 @@ class Context:
     makes it obvious what run()/emit() depend on and lets tests reset it with ``STATE.reset()``.
     """
 
-    __slots__ = ("dry_run", "json", "json_brief", "progress", "fast", "duration_hint", "commands", "timeout", "overwrite", "written", "preexisting", "checked", "plan", "plan_written", "plan_inputs", "codec", "alpha_line",
+    __slots__ = ("parser", "dry_run", "json", "json_brief", "progress", "fast", "duration_hint", "commands", "timeout", "overwrite", "written", "preexisting", "checked", "plan", "plan_written", "plan_inputs", "codec", "alpha_line",
                  "hw", "hw_source", "hw_notes", "hw_swaps", "hw_fallback", "hw_env_ignored", "hw_stages", "hw_auto",
                  "notes", "warnings", "fallbacks", "skipped", "audit_log", "stage_verification", "first_input", "audio_inputs", "video_inputs",
-                 "source_timecode", "smpte_hint", "delivered", "expected_timecode", "watched", "temp_dirs", "side_deliveries")
+                 "source_timecode", "smpte_hint", "delivered", "expected_timecode", "watched", "temp_dirs", "side_deliveries",
+                 "_stream_copy_outputs", "_encoded_media", "measured_plan_inputs", "plan_generated_inputs",
+                 "sequence_frames_sha256")
 
     def __init__(self) -> None:
         self.reset()
@@ -386,6 +395,8 @@ class Context:
         self.fast = False         # x264 preset forced to veryfast
         self.duration_hint: Optional[float] = None  # expected output length, for the progress percent
         self.commands: List[str] = []               # every ffmpeg command line, for --json and --dry-run
+        self._stream_copy_outputs: Dict[str, Dict[str, int]] = {}
+        self._encoded_media = False
         self.timeout: float = _env_timeout()         # seconds per ffmpeg invocation, 0 = none
         self.overwrite = False                       # --overwrite: an existing output may be replaced
         self.written: set = set()                    # output paths this process has written itself
@@ -394,6 +405,9 @@ class Context:
         self.plan: Optional[str] = None              # --plan FILE: write the dry-run as a plan document (implies --dry-run)
         self.plan_written = False                    # write_plan() ran (emit or the exit hook), so the hook does not write twice
         self.plan_inputs: List[str] = []             # side inputs (srt/ass/lut/font files) a tool named through escape_filter_path
+        self.plan_generated_inputs: set[str] = set()  # temporary inputs reconstructed by the tool
+        self.sequence_frames_sha256: Optional[str] = None
+        self.measured_plan_inputs: Dict[str, Dict[str, Any]] = {}  # fingerprints taken before plan measurements
         self.codec: Optional[str] = None             # --codec: encoder for the re-encode (None = x264 for SDR, x265 for HDR)
         self.alpha_line: Optional[str] = None        # --keep-alpha / --transparent: the alpha line written (_common.alpha.ALPHA_CODECS)
         self.hw = False                              # --hw / $FFMPEG_SKILL_HW: VideoToolbox encoders where they apply
@@ -435,6 +449,26 @@ def finite_float(text: str) -> float:
     return value
 
 
+SHARED = ("--dry-run", "--json", "--json-brief", "--progress", "--fast", "--timeout", "--overwrite", "--plan", "--output")  # on every tool
+
+
+def _teach(ap: "argparse.ArgumentParser") -> str:
+    """For each --flag on the command line this tool lacks: a near option, else the options whose help uses the word, and the tools that take it."""
+    import difflib
+    acts = {o: a for o, a in ap._option_string_actions.items() if o.startswith("--")}
+    here, tips = os.path.dirname(os.path.abspath(sys.argv[0])), ""
+    for flag in dict.fromkeys(a.split("=")[0] for a in sys.argv[1:] if re.match(r"--[a-z]", a)):
+        if not any(o.startswith(flag) for o in acts):
+            word = flag[2:] if len(flag) > 5 and flag != "--from" else "\0"  # --to, --at and --from are in every help text
+            # options that share a word with the flag (--pad-color and --fill-color), else a near spelling
+            near = [o for o in acts if set(flag[2:].split("-")) - {"to", "at", "in", "no", "min", "max", "from"} & set(o[2:].split("-"))][:5] or difflib.get_close_matches(flag, acts, 2, 0.85)
+            said = [o for o, a in acts.items() if re.search(rf"\b{re.escape(word)}".replace("\\-", "[- ]"), a.help or "", re.I) and o not in near and o not in SHARED][:2]
+            tools = sorted(n for n in os.listdir(here) if n[0] != "_" and n.endswith(".py") and f'"{flag}"' in open(os.path.join(here, n), encoding="utf-8").read())
+            tips += (f"\n{flag} is not an option of this tool" + (f"; did you mean {' or '.join(near)}?" if near else "") + (f"; {' and '.join(said)} mention '{word}'" if said else "")
+                     + (f" ({', '.join(tools)} take {flag})" if tools else ""))
+    return tips
+
+
 def add_common(ap: "argparse.ArgumentParser", codec: bool = True) -> None:
     """Add the flags every script shares. `codec=False` is for a tool that re-encodes but whose
     preset decides the encoder (export.py): it must not advertise --codec/--quality in its schema."""
@@ -450,9 +484,10 @@ def add_common(ap: "argparse.ArgumentParser", codec: bool = True) -> None:
         if "is not a finite number" in message and {"--json", "--json-brief"} & set(sys.argv[1:]):
             STATE.json = True
             die(message.replace("argument ", "", 1))
-        usage_error(message)
+        usage_error(message + _teach(ap))
 
     ap.error = error  # type: ignore[method-assign]
+    STATE.parser = ap
     g = ap.add_argument_group("agent options")
     g.add_argument("--dry-run", action="store_true", help="print the ffmpeg commands that would run, run nothing")
     g.add_argument("--json", action="store_true", help="print a JSON result (output, probe, commands) on stdout instead of the path")
@@ -503,6 +538,13 @@ def hw_flag(args: "argparse.Namespace") -> Optional[bool]:
 
 
 def apply_common(args: "argparse.Namespace") -> None:
+    # argparse takes a shortened option name: `freeze.py --time 3` ran as --timeout 3 and said nothing.
+    # A tool's own options keep that (callers use it); the options every tool shares are spelled in full.
+    acts = getattr(getattr(STATE, "parser", None), "_option_string_actions", {})
+    for flag in [a.split("=")[0] for a in sys.argv[1:] if acts and re.match(r"--[a-z]", a) and a.split("=")[0] not in acts]:
+        hit = [o for o in SHARED if o.startswith(flag)]
+        if hit:
+            STATE.parser.error(f"{flag} is not an option of this tool, and {hit[0]}, the shared option it is the start of, is spelled in full")
     STATE.plan = getattr(args, "plan", None) or None
     STATE.dry_run = bool(getattr(args, "dry_run", False)) or bool(STATE.plan)
     if STATE.plan:
@@ -519,7 +561,7 @@ def apply_common(args: "argparse.Namespace") -> None:
         # check, cropdetect, silence --list, report and verify printed text (or a bare document,
         # or a document and then a path) under --json-brief alone (review of #521)
         args.json = STATE.json
-    STATE.progress = bool(getattr(args, "progress", False))
+    STATE.progress = bool(getattr(args, "progress", False) or os.environ.get(MCP_PROGRESS_ENV) == "1")
     STATE.fast = bool(getattr(args, "fast", False))
     STATE.overwrite = bool(getattr(args, "overwrite", False))
     if STATE.plan and os.environ.get("FFMPEG_SKILL_READ_ONLY", "") not in ("", "0"):
@@ -549,6 +591,14 @@ def apply_common(args: "argparse.Namespace") -> None:
         env_limit, env_problem = _read_env_timeout()
         if env_problem:
             warn(env_problem, "timeout_env_invalid", value=os.environ.get("FFMPEG_SKILL_TIMEOUT"), timeout=env_limit)
+    # one step for every number a tool takes (#645): the range its help states as a..b is the range it
+    # takes, a negative needs a help that names one, and nothing but a sample count is past a million
+    for a in getattr(getattr(STATE, "parser", None), "_actions", ()):
+        v, text = getattr(args, a.dest, None), a.help or ""
+        span = re.search(r"(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)", text)
+        if a.type in (int, float) and isinstance(v, (int, float)) and v != a.default and a.dest not in ("timeout", "length_samples") and (
+                not float(span[1]) <= v <= float(span[2]) if span else abs(v) > 1e6 or (v < 0 and not re.search(r"-\d|dB|degree|stops", text))):
+            die(f"{next((o for o in a.option_strings if o in [x.split('=')[0] for x in sys.argv[1:]]), a.option_strings[0])} {v:g} is outside what this option takes" + (f", {span[0]}" if span else ""), hint=text.replace("%%", "%") or None)
     if STATE.fast and getattr(args, "preset", None) in X264_PRESETS:
         args.preset = "veryfast"
     STATE.codec = getattr(args, "codec", None) or None
@@ -1007,6 +1057,10 @@ def _refuse_url_media(cmd: Sequence[str]) -> None:
         values.append(last)
         if base.startswith("ffprobe"):  # ffprobe's input is its last argument
             _refuse_playlist(last)
+    elif base.startswith("ffprobe") and last != "-" and os.path.lexists(last):
+        # a file named like an option is still ffprobe's input: guard_input_names() writes it
+        # `./name`, so it is checked as a playlist like any other (review of #636)
+        _refuse_playlist(last)
     for value in values:
         if looks_like_url(value):
             refuse("input", "media_path_is_url",
@@ -1030,11 +1084,9 @@ def _check_no_overwrite_input(cmd: Sequence[str]) -> None:
         out_real = os.path.realpath(output)
     except OSError:
         return
-    for i, a in enumerate(cmd):
-        if a == "-i" and i + 1 < len(cmd):
-            inp = cmd[i + 1]
-            if same_file(inp, output):
-                _refuse_output_is_input(output, inp, out_real, "would overwrite it while ffmpeg is still reading it")
+    for inp in shape_of(cmd).inputs:
+        if same_file(inp, output):
+            _refuse_output_is_input(output, inp, out_real, "would overwrite it while ffmpeg is still reading it")
 
 
 def same_file(a: str, b: str) -> bool:
@@ -1093,6 +1145,12 @@ def _check_output_path(cmd: Sequence[str]) -> None:
         refuse("input", "media_path_is_url",
                f"output {output!r} would be opened by ffmpeg as a URL, not as a local file; pass a plain path "
                "(a local name containing a colon works as ./name)", path=output, scheme=output.split(":", 1)[0].lower())
+    if re.search(r"\.(m3u8?|mpd)$|%0?\d*d[^/\\]*\.(png|jpe?g|bmp|tiff?|webp|dpx|exr|tga|p[pg]m|jp2)$", output, re.I) and "-update" not in cmd:
+        # a playlist or a numbered pattern makes ffmpeg write files it names itself (out0.ts,
+        # frame001.png): no guard here has seen them, and -y replaced the ones that existed (#562)
+        refuse("input", "output_extension_unsupported",
+               f"output {output!r} would make ffmpeg write files it names itself (segments, numbered frames), over any that exist; this skill writes one file per -o",
+               output=output)
     if os.path.isdir(output):
         refuse("input", "output_is_directory",
                f"output {output!r} is a directory; pass a file path (e.g. {os.path.join(output, 'result.mp4')!r})", output=output)
@@ -1105,6 +1163,20 @@ def _check_output_path(cmd: Sequence[str]) -> None:
         refuse("input", "output_dir_not_writable", f"output directory {parent!r} is not writable", output=output, directory=parent)
 
 
+class Shape(NamedTuple):
+    # What an ffmpeg command line reads and writes, found once: the checks below each used to
+    # search the argument list for `-i` and take the last argument as the output themselves.
+    inputs: Tuple[str, ...]        # every `-i` value, in order
+    output: str                    # the last argument
+    output_opts: Tuple[str, ...]   # what follows the last input's path, before the output
+
+
+def shape_of(cmd: Sequence[str]) -> Shape:
+    last_input = max((i for i, tok in enumerate(cmd[:-1]) if tok == "-i"), default=-1)
+    return Shape(tuple(str(cmd[i + 1]) for i, tok in enumerate(cmd[:-1]) if tok == "-i"),
+                 str(cmd[-1]) if cmd else "", tuple(str(a) for a in cmd[last_input + 2:-1]))
+
+
 def _check_output_extension(cmd: Sequence[str]) -> None:
     """An ffmpeg output with no file extension and no `-f` after its last input leaves the muxer
     nothing to choose a container by: refused as `kind: input` before anything runs, dry runs
@@ -1115,15 +1187,82 @@ def _check_output_extension(cmd: Sequence[str]) -> None:
     output = cmd[-1]
     if output == "-" or output.startswith("pipe:"):
         return
+    forced = "-f" in shape_of(cmd).output_opts
     if len(os.path.splitext(output)[1]) > 1:
         refuse_unwritten_output(output, cmd)
+        if not forced:
+            _refuse_unknown_extension(output)
         return
-    last_input = max((i for i, tok in enumerate(cmd[:-1]) if tok == "-i"), default=-1)
-    if "-f" in cmd[last_input + 2:-1]:
+    if forced:
         return
     refuse("input", "output_extension_missing",
            f"output {output!r} has no file extension, so ffmpeg cannot tell which container to write; "
            f"name it with one (for example {output + '.mp4'!r})", output=output)
+
+
+# Extensions every FFmpeg build this skill supports maps to a muxer: an output named with one is
+# handed on without asking the build (no process). `.mka` is here because the Matroska audio muxer
+# shares its name with the Matroska one, so `ffmpeg -h muxer=matroska` never lists it.
+_COMMON_OUTPUT_EXT = frozenset({
+    ".mp4", ".mov", ".mkv", ".mka", ".webm", ".m4v", ".m4a", ".avi", ".ts", ".mts", ".m2ts", ".mxf", ".3gp", ".wmv",
+    ".wma", ".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".wav", ".flac", ".mp3", ".aac", ".ogg",
+    ".opus", ".aif", ".aiff", ".caf", ".srt", ".ass", ".vtt", ".nut", ".mpg", ".mpeg", ".flv", ".y4m"})
+_MUXER_EXT: "List[Optional[frozenset]]" = []  # this build's answer, read once per process
+
+
+def _muxer_extensions() -> "Optional[frozenset]":
+    """Every file extension this ffmpeg build maps to a muxer (lower case, with the dot), or None
+    when the build could not be asked: the names from `ffmpeg -muxers`, and each one's "Common
+    extensions:" line from `ffmpeg -h muxer=NAME`. That is a short process per muxer (about 190
+    on 6.1.1, 1 to 2 s together), so it is asked only for an extension _COMMON_OUTPUT_EXT does not
+    hold, and once. One muxer that cannot be read makes the whole answer None, never a shorter list."""
+    if _MUXER_EXT:
+        return _MUXER_EXT[0]
+    found: Optional[frozenset] = None
+    try:
+        exe = found_exe("ffmpeg")
+        kw: Dict[str, Any] = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True,
+                                  encoding="utf-8", errors="replace", timeout=_probe_limit())
+        listing = subprocess.run([exe, "-hide_banner", "-muxers"], **kw)
+        names = re.findall(r"^\s*D?E[d ]?\s+(\S+)", listing.stdout.split("--", 1)[-1], re.M) if listing.returncode == 0 else []
+
+        def extensions(name: str) -> List[str]:
+            shown = subprocess.run([exe, "-hide_banner", "-h", f"muxer={name.split(',')[0]}"], **kw)
+            if shown.returncode != 0 or "Muxer " not in shown.stdout:
+                raise OSError(f"muxer {name} could not be read")
+            return [e.strip().lower() for line in re.findall(r"^\s*Common extensions:\s*(.+?)\.?\s*$", shown.stdout, re.M)
+                    for e in line.split(",") if e.strip()]
+
+        if names:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                exts = {"." + e for group in pool.map(extensions, names) for e in group}
+            found = frozenset(exts) or None
+    except (OSError, ValueError, subprocess.TimeoutExpired, SystemExit):
+        found = None
+    _MUXER_EXT.append(found)
+    return found
+
+
+def _refuse_unknown_extension(output: str) -> None:
+    """An output whose extension this ffmpeg build maps to no muxer is refused as `kind: input`
+    before ffmpeg runs, dry runs included (#558): `-o weird.xyz` failed inside ffmpeg as `kind:
+    ffmpeg` ("Unable to choose an output format") after a dry run that completed. FFmpeg chooses
+    the muxer by the extension alone, without case, so the build's own list decides
+    (_muxer_extensions()); when the build cannot be asked the command runs as before."""
+    ext = os.path.splitext(output)[1].lower()
+    if ext in _COMMON_OUTPUT_EXT:
+        return
+    known = _muxer_extensions()
+    if known is None or ext in known:
+        return
+    from _common.decision import AUDIO_CODECS  # decision imports this module
+    refuse("input", "output_extension_unknown",
+           f"output {output!r}: this ffmpeg build has no muxer for the extension {ext}, so it cannot tell "
+           "which container to write",
+           hint="name -o with an extension the tool writes: .mp4, .mov or .mkv for video; for a tool that writes "
+                f"sound, {', '.join(AUDIO_CODECS)}; for one that writes a picture, .png or .jpg",
+           output=output, extension=ext)
 
 
 # The WMA codecs ffprobe names (FFmpeg's decoders): a stream of one of them copied into `.wma` is
@@ -1168,7 +1307,7 @@ def _copies_wma_only(cmd: Sequence[str]) -> bool:
                 continue
             return False
         probe_cmd = [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-show_entries",
-                     "stream=codec_type,codec_name:stream_disposition=attached_pic", "-of", "json", path]
+                     "stream=codec_type,codec_name:stream_disposition=attached_pic", "-of", "json", file_arg(path)]
         try:
             proc = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                   timeout=_probe_limit())
@@ -1217,7 +1356,7 @@ def _an_input_has(cmd: Sequence[str], kind: str) -> bool:
     to refuse: cut.py names -c:a aac for a silent source too. Anything not known counts as present."""
     if any(tok in ("-filter_complex", "-lavfi", "-filter_complex_script") for tok in cmd):
         return True
-    paths = [cmd[i + 1] for i, tok in enumerate(cmd[:-1]) if tok == "-i"]
+    paths = shape_of(cmd).inputs
     if not paths:
         return True
     for i, tok in enumerate(cmd[:-1]):
@@ -1227,7 +1366,7 @@ def _an_input_has(cmd: Sequence[str], kind: str) -> bool:
         if not os.path.isfile(path):
             return True
         probe_cmd = [shutil.which("ffprobe") or "ffprobe", "-v", "error", "-select_streams", kind,
-                     "-show_entries", "stream=index", "-of", "csv=p=0", *still_input_args(path), path]
+                     "-show_entries", "stream=index", "-of", "csv=p=0", *input_format_args(path), file_arg(path)]
         limit = _probe_limit()  # PROBE_TIMEOUT, or --timeout when that is lower; never unlimited (--timeout 0)
         try:
             proc = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=limit)
@@ -1288,8 +1427,7 @@ def _check_picture_into_audio_extension(cmd: Sequence[str]) -> None:
     ext = os.path.splitext(output)[1].lower()
     if ext not in AUDIO_MEDIA_EXT:
         return
-    last_input = max((i for i, tok in enumerate(cmd[:-1]) if tok == "-i"), default=-1)
-    if "-vn" in cmd[last_input + 2:-1]:
+    if "-vn" in shape_of(cmd).output_opts:
         return
     encoders = []
     for i, tok in enumerate(cmd[:-2]):
@@ -1385,7 +1523,7 @@ def _check_build_components(cmd: Sequence[str]) -> None:
     encoders: List[str] = []
     streams: Dict[str, set] = {}  # encoder -> the stream kinds ("v", "a", "s") it is named for
     filters: List[str] = []
-    output_opts = {str(tok) for tok in cmd[last_input + 2:-1]}
+    output_opts = set(shape_of(cmd).output_opts)
     for i in range(1, len(cmd) - 1):
         tok, value = str(cmd[i]), str(cmd[i + 1])
         m = _ENCODER_OPTION_RE.match(tok)
@@ -2418,6 +2556,30 @@ def _hw_fallback(cmd: List[str], ctx: "Context") -> Optional[List[str]]:
     return out if changed else None
 
 
+def _record_media_write(ctx: Context, cmd: Sequence[str], output: str) -> None:
+    """Record evidence from a successful FFmpeg write, separately from the printable plan."""
+    if output == "-" or output.startswith("pipe:"):
+        return
+    identity = owned_identity(output)
+    if not identity:
+        return
+    options = shape_of(cmd).output_opts
+    codecs = [(arg, value) for arg, value in zip(options, options[1:])
+              if re.fullmatch(r"-(?:(?:c|codec)(?::\S+)?|[vasdt]codec)", arg)]
+    if any(arg in ("-c", "-codec") for arg, _ in codecs) and all(value == "copy" for _, value in codecs):
+        ctx._stream_copy_outputs[_checked_key(output)] = identity
+    else:
+        # A later concat/remux may copy an intermediate that this run encoded.
+        ctx._encoded_media = True
+
+
+def stream_copy_output(ctx: Context, output: str) -> bool:
+    """Conservatively prove stream copy for the current file using this runner's write records."""
+    identity = ctx._stream_copy_outputs.get(_checked_key(output))
+    return bool(identity and not ctx._encoded_media and not ctx.stage_verification
+                and owned_identity(output) == identity)
+
+
 def run(cmd: Sequence[str], *, quiet: bool = False, check: bool = True, ctx: "Optional[Context]" = None) -> subprocess.CompletedProcess:
     """Run a command, echoing it to stderr unless quiet. Exits on failure when check=True.
 
@@ -2432,16 +2594,14 @@ def run(cmd: Sequence[str], *, quiet: bool = False, check: bool = True, ctx: "Op
     """
     ctx = ctx or STATE
     is_ffmpeg = _is_ffmpeg(cmd)
-    cmd = guard_still_patterns(cmd)  # before it is checked, recorded or run
-    if not is_ffmpeg:
-        _refuse_url_media(cmd)  # ffprobe reads a URL or a playlist as readily as ffmpeg does
+    _refuse_url_media(cmd)  # check the caller's formats before the runner adds input options
+    cmd = guard_input_names(cmd)  # before it is checked, recorded or run
     if is_ffmpeg:
         # an encoder line that converts a BT.601 source to the BT.709 it is tagged with carries
         # that conversion as a -vf; it joins the tool's own graph here, before anything records
         # or runs the command (color.py imports this module, hence the late import)
         from _common.color import fold_bt709_matrix
         cmd = fold_bt709_matrix(cmd)
-        _refuse_url_media(cmd)
         _check_no_overwrite_input(cmd)
         _check_output_path(cmd)
         _check_output_extension(cmd)
@@ -2527,6 +2687,8 @@ def run(cmd: Sequence[str], *, quiet: bool = False, check: bool = True, ctx: "Op
                 _remember_output(cmd)
             else:
                 _cleanup_partial_output(exec_cmd)
+        if is_ffmpeg and proc.returncode == 0:
+            _record_media_write(ctx, tried, cmd[-1])
     return proc
 
 
@@ -2590,7 +2752,8 @@ def _execute(exec_cmd: List[str]) -> subprocess.CompletedProcess:
         return _run_captured(cmd, False)
 
 
-def run_analysis(cmd: Sequence[str], *, check: bool = True, text: bool = True, record: bool = False) -> subprocess.CompletedProcess:
+def run_analysis(cmd: Sequence[str], *, check: bool = True, text: bool = True, record: bool = False,
+                 timeout_is_fatal: bool = True) -> subprocess.CompletedProcess:
     """Run an ffmpeg *measurement* (scene scores, crop rectangles, decoded PCM, signal stats,
     silence detection, loudness, stabilisation pass 1): output to `-f null`, a pipe or a temp
     file, no deliverable written. These are not run() calls -- they run under --dry-run too,
@@ -2598,9 +2761,10 @@ def run_analysis(cmd: Sequence[str], *, check: bool = True, text: bool = True, r
     silences" and loudness.py a made-up -20 LUFS under --dry-run) -- but they get the same
     wall-clock limit as any other ffmpeg invocation and, with check=True, the same `kind: ffmpeg`
     failure instead of an exit-0 "0 scenes found" over a file ffmpeg could not read. record=True
-    lists the command in the --json `commands` like run() does."""
-    cmd = guard_still_patterns(cmd)
+    lists the command in the --json `commands` like run() does. With
+    timeout_is_fatal=False, raise TimeoutExpired so advisory callers can report a missing measurement."""
     _refuse_url_media(cmd)
+    cmd = guard_input_names(cmd)
     if record:
         STATE.commands.append(_cmdline(cmd))
     limit = _limit_for(cmd)
@@ -2612,11 +2776,42 @@ def run_analysis(cmd: Sequence[str], *, check: bool = True, text: bool = True, r
         with long_filters_in_files(cmd) as exec_cmd:
             proc = subprocess.run(exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, **text_kw, timeout=limit)
     except subprocess.TimeoutExpired:
+        if not timeout_is_fatal:
+            raise
         _timed_out(cmd, limit or 0)
     if check and proc.returncode != 0:
         err = proc.stderr if text else proc.stderr.decode(errors="replace")
         _fail(cmd, proc.returncode, err)
     return proc
+
+
+def path_denied(path: Any) -> bool:
+    """True when `path` cannot be looked at or read for lack of permission: a directory on the
+    way to it that the user may not search (os.stat fails with EACCES, which os.path.exists()
+    reports as "not there"), or a file that is there and may not be read. False for a path that
+    is simply absent (#558: both were reported as "not found")."""
+    try:
+        os.stat(path)
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return not os.path.isdir(path) and not os.access(path, os.R_OK)
+
+
+def absent_word(path: Any) -> str:
+    """"permission denied" or "not found", for the message about a file that could not be opened."""
+    return "permission denied" if path_denied(path) else "not found"
+
+
+def refuse_denied_input(path: Any, what: str = "input") -> None:
+    """Refuse a file the user may not reach or read as what it is (`input_permission_denied`),
+    for a real run and a dry run alike. Nothing for any other path, an absent one included."""
+    if path_denied(path):
+        refuse("input", "input_permission_denied", f"{what} cannot be read: permission denied: {path}",
+               hint="the file, or a directory on the way to it, is not readable by the user this runs as: "
+                    "change its permissions or copy it somewhere readable",
+               path=str(path))
 
 
 def dry_run_input_pending(path: str) -> bool:
@@ -2732,40 +2927,87 @@ def _stop_child(child: subprocess.Popen, communicate: bool = True) -> "Tuple[boo
     return False, wait()
 
 
+def _capture_tool_progress(child: subprocess.Popen, limit: Optional[float],
+                           report: Callable[[str], None]) -> Tuple[str, str, Optional[bool]]:
+    """Drain both pipes while the tool runs. Only tagged progress is sent to the caller."""
+    import threading
+
+    out, err = [], []
+    assert child.stdout is not None and child.stderr is not None
+
+    def stdout_reader() -> None:
+        out.append(child.stdout.read())
+
+    def stderr_reader() -> None:
+        for line in child.stderr:
+            if line.startswith(_PROGRESS_PREFIX):
+                try:
+                    report(line[len(_PROGRESS_PREFIX):].strip())
+                except OSError:
+                    # A closed transport must not leave the child's stderr pipe undrained.
+                    pass
+            else:
+                err.append(line)
+
+    readers = [threading.Thread(target=reader, daemon=True) for reader in (stdout_reader, stderr_reader)]
+    for reader in readers:
+        reader.start()
+    stopped = None
+    try:
+        child.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        stopped, _ = _stop_child(child, communicate=False)
+    for reader in readers:
+        reader.join()
+    child.stdout.close()
+    child.stderr.close()
+    return "".join(out), "".join(err), stopped
+
+
+def _relay_progress(message: str) -> None:
+    sys.stderr.write(_PROGRESS_PREFIX + message + "\n")
+    sys.stderr.flush()
+
+
 def run_tool(argv: Sequence[str], *, per_call: Optional[float] = None,
              env: Optional[Dict[str, str]] = None,
-             on_start: "Optional[Callable[[subprocess.Popen], None]]" = None) -> subprocess.CompletedProcess:
+             on_start: "Optional[Callable[[subprocess.Popen], None]]" = None,
+             on_progress: "Optional[Callable[[str], None]]" = None) -> subprocess.CompletedProcess:
     """Run a sibling script (`argv[0]` is the script path) under child_limit(). On overrun the
     child is stopped (_stop_child()) and a CompletedProcess is returned whose stdout is this skill's own failure
     document (kind timeout, exit 124), so callers that parse the child's --json see a timeout
     exactly as they would from the child itself. `env` replaces the inherited environment.
     `on_start(child)` is called once the child is running (the MCP server keeps it to stop a call
-    the client cancels)."""
+    the client cancels). Tagged progress is streamed to `on_progress` or relayed to the MCP
+    process through a parent tool such as render.py."""
     limit = child_limit(per_call)
     child = subprocess.Popen([sys.executable] + list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
     _watch(child, [])  # a sibling script removes its own partial output; there is none of ours to clean
     if on_start is not None:
         on_start(child)
+    report = on_progress
+    if report is None and (os.environ if env is None else env).get(MCP_PROGRESS_ENV) == "1":
+        report = _relay_progress
     try:
-        out, err = child.communicate(timeout=limit)
-        _unwatch(child)
-        return subprocess.CompletedProcess(child.args, child.returncode, out, err)
+        if report is None:
+            out, err = child.communicate(timeout=limit)
+            stopped_cleanly = None
+        else:
+            out, err, stopped_cleanly = _capture_tool_progress(child, limit, report)
     except subprocess.TimeoutExpired:
-        # A183: the child is asked to stop first. A sibling script's SIGTERM handler stops its
-        # ffmpeg, removes the partial output and releases its output lock before it exits; a
-        # SIGKILL left the partial file under the final output name and a stale lock beside it,
-        # under a document that said kind timeout. Killed only when it has not exited in
-        # STOP_GRACE seconds (and at once on Windows, where terminate() is a kill).
-        stopped_cleanly, rest = _stop_child(child)
+        stopped_cleanly, err = _stop_child(child)
+    finally:
         _unwatch(child)
-        name = os.path.basename(str(argv[0]))
-        msg = (f"{name} did not finish within {limit:g} s (4x the per-ffmpeg --timeout plus 60 s) and was "
-               + ("stopped" if stopped_cleanly else "killed"))
-        doc = {"status": "failed", "exit_code": 124,
-               "error": {"kind": "timeout", "message": msg, "code": ERROR_CODE["timeout"], "retryable": ERROR_RETRYABLE},
-               "commands": []}
-        # communicate() after a timeout returns everything the child wrote, the part read before too
-        return subprocess.CompletedProcess(list(argv), 124, json.dumps(doc), rest + f"\nerror: {msg}\n")
+    if stopped_cleanly is None:
+        return subprocess.CompletedProcess(child.args, child.returncode, out, err)
+    # Keep the same failure document and SIGTERM cleanup as the non-streaming path (A183).
+    name = os.path.basename(str(argv[0]))
+    msg = (f"{name} did not finish within {limit:g} s (4x the per-ffmpeg --timeout plus 60 s) and was "
+           + ("stopped" if stopped_cleanly else "killed"))
+    doc = {"status": "failed", "exit_code": 124,
+           "error": {"kind": "timeout", "message": msg, "code": ERROR_CODE["timeout"], "retryable": ERROR_RETRYABLE},
+           "commands": []}
+    return subprocess.CompletedProcess(list(argv), 124, json.dumps(doc), err + f"\nerror: {msg}\n")
 
 
 def option_args(flag: str, value: Any) -> List[str]:
@@ -2801,13 +3043,11 @@ def child_args() -> List[str]:
 def _has_non_av_streams(cmd: Sequence[str]) -> bool:
     """Whether the command's first input has a subtitle or data stream (True when it cannot be
     told: the retry then runs as before)."""
-    src = next((str(cmd[i + 1]) for i, a in enumerate(cmd[:-1]) if a == "-i"), None)
+    src = next(iter(shape_of(cmd).inputs), None)
     if not src or not os.path.isfile(src):
         return True
     try:
-        out = subprocess.run([found_exe("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", *still_input_args(src), src],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
-                             timeout=_probe_limit()).stdout
+        out = _ffprobe("-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", *input_format_args(src), file_arg(src)).stdout
     except (OSError, subprocess.TimeoutExpired):
         return True
     kinds = {ln.strip() for ln in out.splitlines() if ln.strip()}
@@ -2845,10 +3085,7 @@ def carried_stream_maps(src: Optional[str], output: str, *, chapters: bool = Tru
     if not src or not os.path.isfile(src):
         return []
     try:
-        out = subprocess.run([found_exe("ffprobe"), "-v", "error", "-show_entries",
-                              "stream=index,codec_type,codec_tag_string:chapter=id", "-of", "json", *still_input_args(src), src],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                             errors="replace", timeout=_probe_limit()).stdout
+        out = _ffprobe("-v", "error", "-show_entries", "stream=index,codec_type,codec_tag_string:chapter=id", "-of", "json", *input_format_args(src), file_arg(src)).stdout
         doc = json.loads(out or "{}")
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return []
@@ -2936,10 +3173,7 @@ def subtitle_codec_args(src: Optional[str], output: str) -> List[str]:
     if not src or not os.path.isfile(src):
         return args
     try:
-        out = subprocess.run([found_exe("ffprobe"), "-v", "error", "-select_streams", "s", "-show_entries",
-                              "stream=codec_name", "-of", "csv=p=0", *still_input_args(src), src],
-                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
-                             errors="replace", timeout=_probe_limit()).stdout
+        out = _ffprobe("-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name", "-of", "csv=p=0", *input_format_args(src), file_arg(src)).stdout
     except (OSError, subprocess.TimeoutExpired):
         return args
     ext = os.path.splitext(output)[1]
@@ -2957,9 +3191,7 @@ def _non_av_kinds(src: Optional[str]) -> Optional[Dict[str, int]]:
     if not src or not os.path.isfile(src):
         return None
     try:
-        proc = subprocess.run([found_exe("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0",
-                               *still_input_args(src), src], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                              encoding="utf-8", errors="replace", timeout=_probe_limit())
+        proc = _ffprobe("-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", *input_format_args(src), file_arg(src))
     except (OSError, subprocess.TimeoutExpired):
         return None
     kinds = [ln.strip().strip(",") for ln in (proc.stdout or "").splitlines() if ln.strip()]
@@ -2999,7 +3231,7 @@ def run_keeping_subtitles(cmd: List[str], output: str, relabel_timecode: bool = 
     so a source's tmcd data track is not copied -- its label, at the source's rate, would win over
     the new one; the MOV/MP4 muxer builds the track again from the label."""
     skip_tmcd = ["-map", "-0:d:m:timecode"] if relabel_timecode else []
-    src = next((str(cmd[i + 1]) for i, a in enumerate(cmd[:-1]) if a == "-i"), None)
+    src = next(iter(shape_of(cmd).inputs), None)
     sub_args = ["-map", "0:s?"] + carried_stream_maps(src, output, chapters=False) + subtitle_codec_args(src, output)
     data_args = ["-map", "0:d?"] + skip_tmcd + carried_stream_maps(src, output, attachments=False) + ["-c:d", "copy"]
     first = run(cmd + sub_args + data_args + [output], check=False)
@@ -3136,9 +3368,10 @@ def _run_with_progress(cmd: List[str], check: bool) -> subprocess.CompletedProce
     err_thread = threading.Thread(target=pump_err, daemon=True)
     err_thread.start()
     last = ""
+    mcp_progress = os.environ.get(MCP_PROGRESS_ENV) == "1"
 
     def clear_line() -> None:
-        if last:
+        if last and not mcp_progress:
             sys.stderr.write("\r" + " " * len(last) + "\r")
 
     def timed_out() -> None:
@@ -3164,8 +3397,12 @@ def _run_with_progress(cmd: List[str], check: bool) -> subprocess.CompletedProce
                 continue
             msg = _progress_line(done, total, time.time() - t0)
             if msg != last:
-                sys.stderr.write(msg)
-                sys.stderr.flush()
+                if mcp_progress:
+                    message = msg.strip() if total > 0 else f"{max(0.0, done):.1f}s processed"
+                    _relay_progress(message)
+                else:
+                    sys.stderr.write(msg)
+                    sys.stderr.flush()
                 last = msg
     try:
         proc.wait(timeout=(max(5.0, limit - (time.time() - t0)) if limit else None))
@@ -3220,6 +3457,7 @@ def place_output(src: str, dst: str, move: bool = False) -> None:
     d, base = os.path.split(dst)
     stem, ext = os.path.splitext(base)
     with _OutputLock(dst):
+        copied = stream_copy_output(STATE, src)
         # under the lock: the target the check above decided about, not one put there since
         # (`src` is the caller's to remove, as on every other refusal)
         refuse_changed_output(dst)
@@ -3227,6 +3465,8 @@ def place_output(src: str, dst: str, move: bool = False) -> None:
             try:
                 os.replace(src, dst)
                 _remember_output(cmd)
+                if copied and (identity := owned_identity(dst)):
+                    STATE._stream_copy_outputs[_checked_key(dst)] = identity
                 return
             except OSError:
                 pass
@@ -3242,10 +3482,12 @@ def place_output(src: str, dst: str, move: bool = False) -> None:
                 except OSError:
                     pass
             die(f"could not place {dst}: {e}", kind="output")
-    _remember_output(cmd)
+        _remember_output(cmd)
+        if copied and (identity := owned_identity(dst)):
+            STATE._stream_copy_outputs[_checked_key(dst)] = identity
 
 
-# extensions ffmpeg opens through the image2 demuxer, the only one that expands `%d` in a name
+# extensions ffmpeg can open through the image2 demuxer, the only one that expands `%d` in a name
 # and the only one that has a `pattern_type` option (gif, avif, mp4... reject it: "Option
 # pattern_type not found")
 _IMAGE2_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".dpx", ".exr", ".tga",
@@ -3253,29 +3495,78 @@ _IMAGE2_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".dpx"
 
 
 def still_input_args(path: str) -> List[str]:
-    """`-pattern_type none` for a still read through image2 whose path has a `%` in it (#408):
-    image2 otherwise reads `logo%d.png` as a numbered sequence and opens `logo1.png`, a file the
-    run's guards and fingerprints never looked at. Empty for every other path, a video or a GIF
-    with a `%` in its name included: their demuxers never expand it and reject the option."""
+    """`-f image2 -pattern_type none` for a still with an image extension whose path has a `%` in
+    it (#408): image2 otherwise reads `logo%d.png` as a numbered sequence and opens `logo1.png`, a
+    file the run's guards and fingerprints never looked at. The demuxer is named because FFmpeg
+    chooses image2 by itself only for a name it reads as a pattern: `a%20b.png` and `50%.png` are
+    opened by png_pipe (jpeg_pipe, ...), which has no `pattern_type` and failed with "Option
+    pattern_type not found" (#558; measured on 6.1.1 for every extension above that it writes).
+    Forced, image2 takes the codec from the extension and reads the one file of that name. Empty
+    for every other path, a video or a GIF with a `%` in its name included: their demuxers never
+    expand it and reject the option."""
     p = str(path)
-    return ["-pattern_type", "none"] if "%" in p and os.path.splitext(p)[1].lower() in _IMAGE2_EXT else []
+    if "%" in p and os.path.splitext(p)[1].lower() in _IMAGE2_EXT:
+        return ["-f", "image2", "-pattern_type", "none"]
+    return []
 
 
-def guard_still_patterns(cmd: Sequence[str]) -> List[str]:
-    """`cmd` with still_input_args() in front of every input that needs it and has neither its
-    own `-pattern_type` nor a forced `-f`: each `-i` of an ffmpeg command, the last argument of an
-    ffprobe one. run() and run_analysis() apply it to every command (A7, #465): the emoji overlay
-    PNGs, grid.py's and broll.py's stills and join.py's had no guard, so `%d` in such a path made
-    image2 open a different file. Every other command is returned as it is."""
+def file_arg(path: Any) -> str:
+    """`path` as an argument a command line reads as a file: a relative name starting with a
+    dash is written `./name` (#558). ffprobe, whose input is a bare argument, read `-report` and
+    `-dash.mp4` as options ("You have to specify one input file", and a log file written beside
+    the caller). The name itself is unchanged everywhere else (documents, messages, guards)."""
+    p = str(path)
+    return "./" + p if p.startswith("-") and p != "-" else p
+
+
+def guard_input_names(cmd: Sequence[str]) -> List[str]:
+    """`cmd` with every input named so that ffmpeg and ffprobe read it as that one file: an input
+    whose name starts with a dash is written `./name` (file_arg(): each `-i` value of an ffmpeg
+    command, and the last argument of an ffprobe one when a file of that name exists, which tells
+    it from an option), then guard_input_formats(). run() and run_analysis() apply it to every
+    command, and so do the frame readers and stream checks that start their own process."""
     cmd = [str(a) for a in cmd]
     base = os.path.basename(cmd[0]) if cmd else ""
-    if not any("%" in a for a in cmd[1:]):
-        return cmd
     if base.startswith("ffprobe"):
-        if still_input_args(cmd[-1]) and "-pattern_type" not in cmd and "-f" not in cmd[:-1]:
-            return cmd[:-1] + still_input_args(cmd[-1]) + cmd[-1:]
+        if len(cmd) > 1 and cmd[-1].startswith("-") and cmd[-1] != "-" and os.path.lexists(cmd[-1]):
+            cmd[-1] = file_arg(cmd[-1])
+    elif base.startswith("ffmpeg"):
+        for i in range(1, len(cmd) - 1):
+            if cmd[i] == "-i":
+                cmd[i + 1] = file_arg(cmd[i + 1])
+    return guard_input_formats(cmd)
+
+
+def riff_wave_args(path: str) -> List[str]:
+    """Select WAV from its RIFF/WAVE header (#518). FFmpeg 9.0.2 can otherwise
+    mistake ordinary PCM for MPEG-TS."""
+    if looks_like_url(path) or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except OSError:
+        return []
+    return ["-f", "wav"] if head[:4] == b"RIFF" and head[8:12] == b"WAVE" else []
+
+
+def input_format_args(path: str) -> List[str]:
+    return riff_wave_args(path) or still_input_args(path)
+
+
+def guard_input_formats(cmd: Sequence[str]) -> List[str]:
+    """Use literal still paths and RIFF/WAVE headers for implicit inputs.
+
+    FFmpeg input options belong to each `-i`. The ffprobe calls without `-i`
+    put the input path last. Keep any explicitly selected input format.
+    """
+    cmd = [str(a) for a in cmd]
+    base = os.path.basename(cmd[0]) if cmd else ""
+    if base.startswith("ffprobe") and "-i" not in cmd[1:-1]:
+        if "-pattern_type" not in cmd[:-1] and "-f" not in cmd[:-1]:
+            return cmd[:-1] + input_format_args(cmd[-1]) + cmd[-1:]
         return cmd
-    if not base.startswith("ffmpeg"):
+    if not base.startswith(("ffmpeg", "ffprobe")):
         return cmd
     out: List[str] = []
     since = 0  # where the current input's options start in `out`
@@ -3284,8 +3575,8 @@ def guard_still_patterns(cmd: Sequence[str]) -> List[str]:
         a = cmd[i]
         if a == "-i" and i + 1 < len(cmd):
             opts = out[since:]
-            if still_input_args(cmd[i + 1]) and "-pattern_type" not in opts and "-f" not in opts:
-                out += still_input_args(cmd[i + 1])
+            if "-pattern_type" not in opts and "-f" not in opts:
+                out += input_format_args(cmd[i + 1])
             out += [a, cmd[i + 1]]
             since = len(out)
             i += 2
@@ -3539,6 +3830,12 @@ def normalize_text(text: str) -> str:
     return _LINE_END.sub("\n", text.lstrip("\ufeff"))
 
 
+def register_plan_input(path: "os.PathLike[str] | str") -> None:
+    """Bind a file the tool read through a parsed argument, regardless of its argv spelling."""
+    if STATE.plan:
+        STATE.plan_inputs.append(os.fspath(path))
+
+
 def read_text_or_die(path: str, flag: str) -> str:
     """Read a caller-supplied UTF-8 text file (a cue list, chapters, notes) or fail as kind input
     with the flag named, instead of a FileNotFoundError / UnicodeDecodeError traceback. The text
@@ -3548,7 +3845,9 @@ def read_text_or_die(path: str, flag: str) -> str:
         die(f"{flag}: {path} is a directory, not a text file")
     try:
         with open(path, "r", encoding="utf-8", newline="") as fh:
-            return normalize_text(fh.read())
+            text = normalize_text(fh.read())
+        register_plan_input(path)
+        return text
     except FileNotFoundError:
         die(f"{flag}: {path} does not exist")
     except IsADirectoryError:
@@ -3608,7 +3907,9 @@ def read_json(path: "os.PathLike[str] | str") -> Any:
     """parse_json() of a UTF-8 file. Raises OSError for a file that cannot be read and ValueError
     (UnicodeDecodeError is one) for anything else, so `except (OSError, ValueError)` covers it."""
     with open(path, "r", encoding="utf-8") as fh:
-        return parse_json(fh.read())
+        doc = parse_json(fh.read())
+    register_plan_input(path)
+    return doc
 
 
 # Deferred to the foot of the module on purpose. runner is the first module the package loads and

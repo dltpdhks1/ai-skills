@@ -34,6 +34,7 @@ Examples:
 """
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -42,7 +43,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from _platforms import (PLATFORMS, PLATFORM_CHOICES, ASS_SCRIPT_HEIGHT, ass_units,
                         resolve as resolve_platform)
-from _ass_overlay import (EMOJI_SENTINEL, emoji_placeholder, ass_escape_markup,
+from _ass_overlay import (EMOJI_SENTINEL, ass_base_encoding, emoji_placeholder, ass_escape_markup,
                           strip_srt_markup, reinsert_srt_markup, carry_srt_markup, srt_alignment)
 from _common.emit import refuse  # noqa: E402
 from _common.emoji import emoji_missing_asset_note, emoji_mono_on_colour_note
@@ -53,6 +54,7 @@ from _common import require_filter, emoji_filter_chain, EMOJI_ASSET_HINT, emoji_
 # caption.parse_srt / caption.transcribe / caption.whisper_word_timings before 1.17 still does.
 from _common import asr as _asr
 from _common.asr import ENGINE_CHOICES
+from _common.decision import ntsc_rate
 from _common.emit import note, warn
 from _common.probe import display_size, square_pixels, square_pixels_note
 from _common.runner import carried_stream_maps, refuse_output_is_input, same_file, subtitle_codec_for, subtitle_container_holds
@@ -60,7 +62,7 @@ from _common.fonts import font_choice, fonts_dir_face, record_font_choice, requi
 from _common import (ASR_INSTALL_HINT, die_no_engine, parse_srt, transcribe, whisper_word_timings,
                      write_srt)
 from _common.asr import srt_blocks
-from _common.runner import normalize_text
+from _common.runner import absent_word, normalize_text
 from _common import (SAFE_WIDTH_FRACTION, ORPHAN_MIN_EM, WRAP_MODES, wrap_text, wrap_variants, best_break,
                      fit_size, line_em_for_size, MIN_CAPTION_FRACTION,
                      break_penalty, _is_weak_line, _atoms, _join, _break_spaced, _bare_word, _function_words,
@@ -85,8 +87,9 @@ ALIGN = {"bottom": 2, "top": 8, "center": 5, "bottom-left": 1, "bottom-right": 3
 FORCE_STYLE_ALIGN = {"bottom": 2, "top": 6, "center": 10, "bottom-left": 1, "bottom-right": 3, "top-left": 5, "top-right": 7}
 
 TIME_RE = re.compile(
-    r"^\s*(?P<a>[\d:.,@]+)\s*(?P<sep>-->|-|–|to)\s*(?P<b>[\d:.,@]+)\s+(?P<text>.+)$"  # @ = the 1.9 @fps suffix
+    r"^\s*(?P<a>[\d:;.,@]+)\s*(?P<sep>-->|-|–|to)\s*(?P<b>[\d:;.,@]+)\s+(?P<text>.+)$"
 )
+DROP_FRAME_CLOCK = r"\d+:\d+:\d+;"
 
 
 def cue_times_match(line: str) -> "Optional[re.Match[str]]":
@@ -97,11 +100,14 @@ def cue_times_match(line: str) -> "Optional[re.Match[str]]":
     m = TIME_RE.match(line)
     if m and m.group("sep") == "to" and not (":" in m.group("a") and ":" in m.group("b")):
         return None
+    if m and any(";" in token and not re.match(DROP_FRAME_CLOCK, token) for token in (m.group("a"), m.group("b"))):
+        return None
     return m
 
 
 # an SRT timing line: the times alone, the cue text on the lines after it
-DROP_FRAME_RE = re.compile(r"^\s*\d+:\d{2}:\d{2};\d+")
+DROP_FRAME_RE = re.compile(r"^\s*(?:\d[\d:.,]*(?:@[^\s-]+)?\s*(?:-->|-|–|to)\s*)?" + DROP_FRAME_CLOCK)
+DROP_FRAME_LABEL = re.compile(r"(\d+):(\d{2}):(\d{2});(\d{2})")
 SRT_TIMING_RE = re.compile(r"^\s*\d+:\d{2}:\d{2}[,.]\d+\s*-->\s*\d+:\d{2}:\d{2}[,.]\d+\s*$")
 # the same line as WebVTT may write it, without the hours: `00:01.000 --> 00:02.000`
 TIMING_ONLY_RE = re.compile(r"^\s*(?:\d+:)?\d{1,2}:\d{2}[,.]\d+\s*-->\s*(?:\d+:)?\d{1,2}:\d{2}[,.]\d+\s*$")
@@ -131,8 +137,33 @@ def refuse_not_a_cue_file(path: str, lines: List[str]) -> None:
                 "caption.py --transcribe writes the cues from the audio", kind="input")
 
 
-def parse_text_cues(path: str, auto_seconds: float, gap: float, fps: Optional[float] = None) -> List[Tuple[float, float, str]]:
+def _cue_time(token: str, fps: Optional[float]) -> float:
+    if ";" not in token:
+        return parse_time(token, fps)
+    label, suffix, rate = token.replace(",", ".").partition("@")
+    match = DROP_FRAME_LABEL.fullmatch(label)
+    if not match:
+        raise ValueError(f"bad drop-frame timecode '{token}' (use hh:mm:ss;ff)")
+    if suffix:
+        fps = float(rate)
+    if not fps or not math.isfinite(fps) or fps <= 0:
+        raise MissingFpsError(f"drop-frame timecode '{token}' needs 29.97 or 59.94 fps")
+    exact = ntsc_rate(fps)
+    if exact not in (30000 / 1001, 60000 / 1001):
+        raise ValueError(f"drop-frame timecode '{token}' needs 29.97 or 59.94 fps, got {fps:g}")
+    h, m, s, frame = map(int, match.groups())
+    nominal = round(exact)
+    dropped = nominal // 15
+    if m > 59 or s > 59 or frame >= nominal or (s == 0 and m % 10 and frame < dropped):
+        raise ValueError(f"drop-frame timecode '{token}' is not a valid label at {fps:g} fps")
+    minutes = h * 60 + m
+    return ((minutes * 60 + s) * nominal + frame - dropped * (minutes - minutes // 10)) / exact
+
+
+def parse_text_cues(path: str, auto_seconds: float, gap: float, fps: Optional[float] = None, *,
+                    source_fps: Optional[float] = None, source_vfr: bool = False) -> List[Tuple[float, float, str]]:
     cues: List[Tuple[float, float, str]] = []
+    mismatch = None
     cursor = 0.0
     # split at "\n" only: splitlines() also breaks a cue at U+2028, U+0085, \v and \f, which
     # made the rest of the line an auto-timed cue of its own
@@ -149,20 +180,20 @@ def parse_text_cues(path: str, auto_seconds: float, gap: float, fps: Optional[fl
             # as captions, auto-timed 3 s apart (#396)
             die(f"--text: {path} is an SRT file (line {n} is a timing line with no text: "
                 f"'{raw.strip()}'); pass it as --srt (render.py: --srt, not --cues)", kind="input")
-        if DROP_FRAME_RE.match(raw):
-            # TIME_RE has no ';', so the line would be burned as caption text, auto-timed
-            die(f"--text: line {n} has a drop-frame timecode (';'), which is not read: write it as "
-                "hh:mm:ss:ff@29.97 or in seconds", kind="input")
+        if DROP_FRAME_RE.match(raw) and not cue_times_match(raw):
+            die(f"--text: line {n} has malformed drop-frame timing; give two times and caption text", kind="input")
     for line in lines:
         if not line.strip():
             continue
         m = cue_times_match(line)
         if m:
             try:
-                start, end = parse_time(m.group("a"), fps), parse_time(m.group("b"), fps)
+                start, end = _cue_time(m.group("a"), fps), _cue_time(m.group("b"), fps)
             except MissingFpsError as e:
                 die(f"cue '{line}': {e} -- pass --fps, or --input's own fps is used automatically when given")
-            except ValueError:
+            except ValueError as exc:
+                if ";" in m.group("a") or ";" in m.group("b"):
+                    die(str(exc))
                 # TIME_RE matched (so m.group("text") is the real cue text, not the broken
                 # timestamp), but one of the two timestamps itself failed to parse (e.g. a
                 # malformed "00:00:03.15.999") -- falling back to `line.strip()` here used to
@@ -171,6 +202,19 @@ def parse_text_cues(path: str, auto_seconds: float, gap: float, fps: Optional[fl
                 start, end, text = cursor, cursor + auto_seconds, m.group("text").strip()
             else:
                 text = m.group("text").strip()
+                for token, chosen in ((m.group("a"), start), (m.group("b"), end)):
+                    label, suffix, rate = token.replace(",", ".").partition("@")
+                    if not source_fps or not (";" in label or label.count(":") == 3):
+                        continue
+                    cue_fps = float(rate) if suffix else fps
+                    if not cue_fps or abs(ntsc_rate(cue_fps) - ntsc_rate(source_fps)) <= 0.005:
+                        continue
+                    if mismatch is None or chosen > mismatch[0]:
+                        try:
+                            drift = None if source_vfr else chosen - _cue_time(label, source_fps)
+                        except ValueError:
+                            drift = None
+                        mismatch = (chosen, cue_fps, drift, label)
         else:
             start, end, text = cursor, cursor + auto_seconds, line.strip()
         if end <= start:
@@ -180,6 +224,13 @@ def parse_text_cues(path: str, auto_seconds: float, gap: float, fps: Optional[fl
         cursor = end + gap
     if not cues:
         die(f"no cues found in {path}")
+    if mismatch:
+        _, cue_fps, drift, label = mismatch
+        impact = (f"{drift:+.3f}s at {label} compared with the source-rate reading" if drift is not None
+                  else f"no source-rate offset can be calculated for {label}")
+        warn(f"caption timecode uses {cue_fps:g} fps; input probes at {source_fps:g} fps ({impact})",
+             "caption_timecode_rate_mismatch", cue_fps=cue_fps, source_fps=source_fps,
+             cue_timecode=label, drift_seconds=round(drift, 6) if drift is not None else None)
     return cues
 
 
@@ -879,6 +930,7 @@ def write_ass(cues: List[Tuple[float, float, str]], path: str, args, play_w: int
     # libass to honour only those explicit breaks and never re-wrap: with WrapStyle: 0 (the sweep
     # default, unchanged), scaling the active word up would re-flow the line and it would visibly
     # jump every time the highlight advances (the trap the issue this implements is filed against).
+    encoding = ass_base_encoding(strip_srt_markup(text) for _, _, text in cues)
     header = [
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_w}", f"PlayResY: {play_h}",
         # YCbCr Matrix: None -- the colours are RGB, to be put in the video's own matrix: FFmpeg 8.x's
@@ -886,7 +938,7 @@ def write_ass(cues: List[Tuple[float, float, str]], path: str, args, play_w: int
         f"WrapStyle: {2 if word_style else 0}", "ScaledBorderAndShadow: yes", "YCbCr Matrix: None", "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{ass_font_name(args.font)},{size},{primary},{secondary},{outline},{back},{-1 if args.bold else 0},0,0,0,100,100,0,0,{3 if args.box else 1},{args.outline * scale:.1f},{args.shadow * scale:.1f},{ALIGN[args.position]},{margin_l},{margin_r},{margin},1",
+        f"Style: Default,{ass_font_name(args.font)},{size},{primary},{secondary},{outline},{back},{-1 if args.bold else 0},0,0,0,100,100,0,0,{3 if args.box else 1},{args.outline * scale:.1f},{args.shadow * scale:.1f},{ALIGN[args.position]},{margin_l},{margin_r},{margin},{encoding}",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     lines = []
@@ -1171,12 +1223,8 @@ def main() -> int:
                           "the first track, same as leaving it unset always did")
     src = ap.add_argument_group("subtitle source")
     src.add_argument("--srt", action=AppendPath, metavar="FILE[:LANG]",
-                     help="SRT file to burn, or (with --mode mux) to add as a soft subtitle track. Repeat it once "
-                          "per language to build a multi-track deliverable, each with an optional `:lang` suffix: "
-                          "`--srt en.srt:en --srt ja.srt:ja`. A single --srt with no suffix takes --language, as "
-                          "it always did. NOTE: .mp4/.mov hold several mov_text tracks but many players show only "
-                          "the first, and the format needs ISO-639-2 codes (`eng`, not `en`) -- this tool converts "
-                          "them; .mkv is the honest multi-track container and stores the code you give verbatim")
+                     help="SRT to burn or (with --mode mux) add as a subtitle track. Repeat FILE:LANG per language "
+                          "for muxing. A single untagged file uses --language. Prefer .mkv for multiple tracks.")
     src.add_argument("--ass", help="ASS file to burn (styles inside the file are used)")
     src.add_argument("--text", help="plain text cue file to convert into SRT (see format above)")
     src.add_argument("--transcribe", action="store_true", help="generate the SRT from the audio with a local speech-to-text engine if one is installed (parakeet-mlx / parakeet.cpp / whisper-cli / whisper / faster-whisper); never required")
@@ -1203,13 +1251,13 @@ def main() -> int:
     src.add_argument("--auto-seconds", type=float, default=3.0, help="duration for cues without timing (default 3)")
     src.add_argument("--gap", type=float, default=0.0, help="gap after auto-timed cues in seconds")
     src.add_argument("--fps", type=float, default=None,
-                      help="frame rate for interpreting hh:mm:ss:ff SMPTE timecode cues in --text (non-drop-frame); "
+                      help="frame rate for SMPTE cues in --text (hh:mm:ss:ff or hh:mm:ss;ff at 29.97 or 59.94); "
                            "defaults to the input video's own fps when --input is given, required otherwise")
     sty = ap.add_argument_group("style (SRT only)")
     sty.add_argument("--brand", help="brand.json: font, colours, caption size/position/animation defaults")
     sty.add_argument("--font", default=None, help="font family, e.g. 'Noto Sans CJK JP' for Japanese (default DejaVu Sans or brand font)")
     sty.add_argument("--fonts-dir", help="directory with extra .ttf/.otf files")
-    sty.add_argument("--size", type=int, default=None, help="font size in ASS points (relative to a 288p script height, scales automatically)")
+    sty.add_argument("--font-size", "--size", dest="size", type=int, default=None, help="font size in ASS points (relative to a 288p script height, scales automatically)")
     sty.add_argument("--color", default=None, help="text colour RRGGBB (default FFFFFF or brand text colour)")
     sty.add_argument("--outline-color", default=None, help="outline colour RRGGBB")
     sty.add_argument("--outline", type=float, default=None, help="outline width (default 2)")
@@ -1247,12 +1295,8 @@ def main() -> int:
                           "cue to cue reads as a mistake, so it is opt-in)")
     sty.add_argument("--min-duration", type=float, default=1.0, help="shortest time a cue stays on screen in seconds, never past the next cue (default 1.0)")
     sty.add_argument("--wrap", choices=list(WRAP_MODES), default="phrase",
-                     help="how a cue too wide for the safe area is broken into lines: 'phrase' (default, 1.16) never "
-                          "breaks inside a word or on the wrong side of a hyphen, never leaves a lone digit, kana or "
-                          "punctuation on a line, prefers Japanese sentence ends and particles over a mid-word break, "
-                          "and never ends a line on an article or preposition; 'measured' is 1.15's width-only wrap, "
-                          "kept so an older split can be reproduced. Neither ever changes the number of lines, "
-                          "rewrites the text or shortens a cue")
+                     help="line breaking for wide cues: phrase-aware (phrase, default) or width-only (measured). "
+                          "Both preserve text, timing and line count.")
     anim = ap.add_argument_group("animation (generates ASS; needs --text or --srt input)")
     anim.add_argument("--animate", choices=["none", "fade", "pop", "slide"], default=None, help="per-cue entrance animation (default none, or brand caption.animate)")
     anim.add_argument("--karaoke", action="store_true", help="word-by-word highlight (fills from --color to --highlight-color across each cue)")
@@ -1614,7 +1658,6 @@ def main() -> int:
                                              engine=args.engine)
             cues = asr_run.cues
             args._asr = dict(asr_run.facts)
-            args._asr_notes = list(asr_run.notes)
             args._word_timings = shift_words(whisper_word_timings(srt_path) or sorted(
                 (w["start"], w["end"], w["word"]) for w in asr_run.words), args.offset)
             cues, changed = lay_out(cues)
@@ -1623,7 +1666,10 @@ def main() -> int:
             info(f"wrote {srt_path} ({len(cues)} cues)")
         args.text = None
     if args.text:
-        cues = parse_text_cues(args.text, args.auto_seconds, args.gap, fps_for_tc)
+        video_clock = (meta or {}).get("video") or {}
+        cues = parse_text_cues(args.text, args.auto_seconds, args.gap, fps_for_tc,
+                               source_fps=video_clock.get("fps"),
+                               source_vfr=bool(video_clock.get("variable_frame_rate_suspected")))
         cues, _ = lay_out(cues)
         if not cues:
             # --offset dropped every cue (one that ends at or before 0 goes): an empty SRT was
@@ -1658,8 +1704,7 @@ def main() -> int:
     # WRITING waits for a real run (the rule every side file in this tool follows), which is why
     # the cues are kept in hand below for the font sample and the ASS generator.
     planned_cues: Optional[List[Tuple[float, float, str]]] = None
-    # an English-only transcript made on an assumption says so first (asr.assumed_english_note)
-    side_notes: List[str] = list(getattr(args, "_asr_notes", None) or [])
+    side_notes: List[str] = []
     ass_counts: dict = {}  # --ass: ass_shifted / ass_unshifted (with --offset) and ass_malformed, into `caption`
     ass_sample_path = args.ass
     normalised_only = False  # srt_path is a copy of the caller's SRT that only rewrites its timings
@@ -1712,7 +1757,7 @@ def main() -> int:
     if args.mode == "mux":
         if not srt_path or (not os.path.exists(srt_path) and not planned_only
                             and not (STATE.dry_run and (args.text or args.transcribe))):
-            die(f"SRT file not found: {srt_path}")
+            die(f"SRT file {absent_word(srt_path)}: {srt_path}")
         codec = mux_subtitle_codec(output)
         out_ext = Path(output).suffix.lower().lstrip(".")
         # The picture and the sound are copied: a WebM holds only VP8/VP9/AV1 and Opus/Vorbis, so
@@ -1748,7 +1793,7 @@ def main() -> int:
                 [(p, lang) for p, lang in srt_tracks[1:]]
         for path, _lang in added[1:]:
             if not os.path.exists(path) and not STATE.dry_run:
-                die(f"SRT file not found: {path}")
+                die(f"SRT file {absent_word(path)}: {path}")
         for n in range(1, len(added)):
             path, lang = added[n]
             pending = not os.path.exists(path)  # a dry run's pending track: an earlier step writes it
@@ -1915,7 +1960,7 @@ def main() -> int:
         sample = "\n".join(t for _, _, t in parse_srt(srt_path)) if os.path.exists(srt_path or "") else ""
     _script, font_file, font_family = script_font_for_text(
         sample, lang=args.language, font=args.font, font_explicit=font_explicit,
-        fonts_dir=args.fonts_dir)
+        fonts_dir=args.fonts_dir, font_bold=args.bold)
     # the font libass draws with, reported as `font_used`: a --fonts-dir (or a brand's font
     # file) is searched first for the family, by libass itself; otherwise fontconfig resolves it
     if args.ass:
@@ -2018,7 +2063,7 @@ def main() -> int:
 
     if args.ass:
         if not generated_ass and not os.path.exists(args.ass) and not planned_ass:
-            die(f"ASS file not found: {args.ass}")
+            die(f"ASS file {absent_word(args.ass)}: {args.ass}")
     # 2.2.6: a burn whose cues are all blank, or all outside the video, draws nothing -- and used
     # to report verified. Count the cues that can actually be seen; none is a refusal.
     if generated_ass:
@@ -2072,7 +2117,7 @@ def main() -> int:
     else:
         if not srt_path or (not os.path.exists(srt_path) and not planned_only
                             and not (STATE.dry_run and (args.text or args.transcribe))):
-            die(f"SRT file not found: {srt_path}")
+            die(f"SRT file {absent_word(srt_path)}: {srt_path}")
         style = [
             f"FontName={ass_font_name(args.font)}",
             f"FontSize={args.size}",
@@ -2086,6 +2131,8 @@ def main() -> int:
             f"Alignment={FORCE_STYLE_ALIGN[args.position]}",
             f"MarginV={args.margin}",
         ]
+        if ass_base_encoding(strip_srt_markup(text) for _, _, text in (burn_cues or ())) == -1:
+            style.append("Encoding=-1")
         force = ",".join(style).replace("\\", "\\\\").replace("'", "\\'")
         vf = f"subtitles=filename={escape_filter_path(srt_path)}:force_style='{force}'"
         if args.fonts_dir:

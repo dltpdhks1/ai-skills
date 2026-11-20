@@ -28,8 +28,8 @@ import tempfile
 from pathlib import Path
 
 from _common.probe import PROBED_VIDEO, probed_maps
-from _common.color import bt709_matrix_filter, is_rgb
-from _common.decision import keeps_source_tags
+from _common.color import is_rgb
+from _common.decision import line_matrix_filter
 from _common.emit import note
 from _common.runner import ffmpeg_failure_extra, require_filter
 from _common import add_common, apply_common, aac_args, cfr_args, with_cfr, default_output, die, emit, escape_filter_path, ffmpeg_base, info, probe, require_tool, run_keeping_subtitles, video_args, X264_PRESETS, run_analysis, dry_run_input_pending, fmt_secs, record_fallback, EVEN_SCALE
@@ -39,7 +39,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input")
     ap.add_argument("-o", "--output", help="output file (default: <name>_stab.<ext>)")
-    ap.add_argument("--shakiness", type=int, default=5, help="1 (barely shaky) .. 10 (very shaky), default 5")
+    ap.add_argument("--strength", "--shakiness", dest="shakiness", type=int, default=5, help="the amount of shake to correct, the strength: 1 (barely shaky) .. 10 (very shaky), default 5")
     ap.add_argument("--smoothing", type=int, default=15, help="frames of camera-path smoothing on each side, default 15")
     ap.add_argument("--zoom", type=float, default=0.0, help="percent to zoom in to hide stabilization edges, 0..100 (default 0)")
     ap.add_argument("--crop", choices=["keep", "black"], default="keep", help="edges --zoom doesn't crop away: keep (stretch border pixels, default) or black (fill solid black)")
@@ -54,8 +54,6 @@ def main() -> int:
         die(f"--shakiness must be 1..10, got {args.shakiness}")
     if not 0 <= args.smoothing <= 1000:
         die(f"--smoothing must be 0..1000, got {args.smoothing}")
-    if not 0 <= args.zoom <= 100:
-        die(f"--zoom must be 0..100, got {args.zoom}")
 
     meta = probe(args.input)
     if not meta.get("video"):
@@ -86,16 +84,14 @@ def main() -> int:
         # vid.stab aborts on an RGB picture (FFmpeg 6.1.1 with libvidstab 1.1: rgb24, bgr24, rgba
         # and gbrp all fail the assertion `fi->planes==1`), so pass 1 failed as kind ffmpeg on a
         # PNG still or an RGB .mov (#531), and yuv444p of the same frames runs. Both passes see YUV
-        # 4:4:4: the BT.709 conversion the encoder line folds into pass 2 for an RGB source
-        # (bt709_matrix_filter), or, on a line that keeps the source's tags and converts no
-        # matrix (--codec prores), FFmpeg's own conversion to yuv444p, as that line's encoder has.
-        # An RGB source that probes HDR or BT.2020 gets FFmpeg's own conversion too (BT.601
-        # coefficients under the source's BT.2020 tags), as on every other re-encoding line:
-        # bt709_matrix_filter converts none of those, and a stabilize-only matrix would be a
-        # second convention ("After 3.8.23", seen and not changed).
+        # 4:4:4: the conversion the encoder line folds into pass 2 for an RGB source
+        # (line_matrix_filter: to BT.709 on the SDR line, with the matrix the line tags on a
+        # BT.2020 / HDR one, #544), or, for an SDR source on a line that keeps the source's tags
+        # and converts no matrix (--codec prores), FFmpeg's own conversion to yuv444p, as that
+        # line's encoder has.
         to_yuv, to_yuv_pass2 = "", ""
         if is_rgb(meta):
-            conv = None if keeps_source_tags() else bt709_matrix_filter(meta)
+            conv = line_matrix_filter(meta)
             to_yuv = (conv or "format=yuv444p") + ","
             to_yuv_pass2 = "" if conv else to_yuv  # the encoder line's conversion is folded in by run() (fold_bt709_matrix)
             note(f"the source is RGB ({v.get('pix_fmt')}), which vid.stab does not take: both passes stabilize a YUV 4:4:4 "

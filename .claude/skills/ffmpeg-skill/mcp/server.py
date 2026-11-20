@@ -3,8 +3,9 @@
 
 Every public script in ../scripts becomes a callable tool, but tools/list defaults to
 advertising only the core 12 (_contract.MCP_CORE_TOOLS) to keep the schema dump small;
-set FFMPEG_SKILL_MCP_FULL=1 to list all 42. Every tool is still callable by name via
-tools/call either way. Tool names, order, inputSchema and the structured-argument mapping
+set FFMPEG_SKILL_MCP_TOOLS to a comma-separated selection or FFMPEG_SKILL_MCP_FULL=1
+to list all 42. Every tool is still callable by name via tools/call. Tool names, order,
+inputSchema and the structured-argument mapping
 all come from the contract (scripts/_contract.py); this file is only the transport.
 Arguments are passed as a flat object (keys = argparse dests) or, for CLI compatibility,
 as an argv list. Results are the script's --json output.
@@ -21,6 +22,7 @@ import os
 import sys
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -160,7 +162,7 @@ def timeout_from_call(args: Dict[str, Any]) -> float:
         return _common._env_timeout()
 
 
-def call_tool(name: str, args: Dict[str, Any], on_start: Any = None) -> Dict[str, Any]:
+def call_tool(name: str, args: Dict[str, Any], on_start: Any = None, on_progress: Any = None) -> Dict[str, Any]:
     """tools/call. `on_start(child)` is handed the tool's process once it runs (the stdio loop
     keeps it, to stop the call if the client cancels it)."""
     script = SCRIPTS / f"{name}.py"
@@ -175,10 +177,14 @@ def call_tool(name: str, args: Dict[str, Any], on_start: Any = None) -> Dict[str
     # A tool annotated readOnlyHint must write nothing: its schema has no `plan`, and this makes
     # the tool itself refuse --plan however a raw argv spells it. Every other tool runs without
     # the variable, even when the server's own environment has it.
-    env = {k: v for k, v in os.environ.items() if k != _contract.READ_ONLY_ENV}
+    progress_env = _common.runner.MCP_PROGRESS_ENV
+    env = {k: v for k, v in os.environ.items() if k not in (_contract.READ_ONLY_ENV, progress_env)}
     if _contract.mcp_read_only(specs()[name]):
         env[_contract.READ_ONLY_ENV] = "1"
     started = {"on_start": on_start} if on_start is not None else {}
+    if on_progress is not None:
+        env[progress_env] = "1"
+        started["on_progress"] = on_progress
     proc = _common.run_tool([str(script)] + argv, per_call=per_call, env=env, **started)
     stdout = proc.stdout.strip()
     text = stdout
@@ -212,19 +218,23 @@ def call_tool(name: str, args: Dict[str, Any], on_start: Any = None) -> Dict[str
 def tool_list() -> List[Dict[str, Any]]:
     """tools/list: one entry per ToolSpec, in the contract's order, inputSchema derived from ToolSpec.input_schema.
 
-    Default surface is the core 12 (_contract.MCP_CORE_TOOLS, roadmap P1-7): the other 30 stay
-    reachable by name through tools/call regardless. FFMPEG_SKILL_MCP_FULL=1 (anything but "" or
-    "0") lists all 42, unchanged from pre-1.18.3 behaviour.
+    Only advertisement is filtered. The full-catalogue switch takes precedence over
+    the optional selection and remains enabled by anything other than "" or "0".
     """
     all_specs = specs()
     if os.environ.get("FFMPEG_SKILL_MCP_FULL", "") not in ("", "0"):
-        names = all_specs.keys()
-    else:
-        names = (n for n in all_specs if n in _contract.MCP_CORE_TOOLS)
-    return [_contract.mcp_tool(all_specs[name]) for name in names]
+        return [_contract.mcp_tool(spec) for spec in all_specs.values()]
+    raw = os.environ.get("FFMPEG_SKILL_MCP_TOOLS", "").strip()
+    selected = {value.strip() for value in raw.split(",") if value.strip()} if raw else set(_contract.MCP_CORE_TOOLS)
+    if raw:
+        unknown = selected.difference(all_specs)
+        if unknown or not selected:
+            detail = f"unknown tool names {', '.join(sorted(unknown))}" if unknown else "no tool names"
+            raise ValueError(f"FFMPEG_SKILL_MCP_TOOLS has {detail}. Use comma-separated tool names from the full list.")
+    return [_contract.mcp_tool(spec) for name, spec in all_specs.items() if name in selected]
 
 
-def handle(req: Dict[str, Any], on_start: Any = None) -> Dict[str, Any]:
+def handle(req: Dict[str, Any], on_start: Any = None, on_progress: Any = None) -> Dict[str, Any]:
     method = req.get("method")
     params = req.get("params") or {}
     if method == "initialize":
@@ -237,7 +247,8 @@ def handle(req: Dict[str, Any], on_start: Any = None) -> Dict[str, Any]:
     if method == "tools/list":
         return {"tools": tool_list()}
     if method == "tools/call":
-        return call_tool(params.get("name", ""), params.get("arguments") or {}, on_start=on_start)
+        return call_tool(params.get("name", ""), params.get("arguments") or {},
+                         on_start=on_start, on_progress=on_progress)
     if method == "prompts/list":
         # roadmap 1.20.0: the five workflow recipes (reel, podcast, multicam, delivery_check, hdr)
         return {"prompts": _contract.mcp_prompt_list()}
@@ -306,13 +317,36 @@ def cancel(params: Any) -> None:
         stopped.set()  # the worker waits for this before it starts the next call
 
 
-def _respond(req: Dict[str, Any], on_start: Any = None) -> Dict[str, Any]:
+def _respond(req: Dict[str, Any], on_start: Any = None, on_progress: Any = None) -> Dict[str, Any]:
     try:
-        return {"jsonrpc": "2.0", "id": req["id"], "result": handle(req, on_start=on_start)}
+        return {"jsonrpc": "2.0", "id": req["id"], "result": handle(req, on_start=on_start, on_progress=on_progress)}
     except KeyError as exc:
         return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": f"method not found: {exc}"}}
     except Exception as exc:  # noqa: BLE001
         return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": str(exc)}}
+
+
+def _progress_reporter(req: Dict[str, Any], entry: Dict[str, Any], out: Any) -> Any:
+    params = req.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    token = meta.get("progressToken") if isinstance(meta, dict) else None
+    if req.get("jsonrpc") != "2.0" or type(token) not in (str, int):
+        return None
+    sequence = 0
+    last = -float("inf")
+
+    def report(message: str) -> None:
+        nonlocal sequence, last
+        now = time.monotonic()
+        if entry["cancelled"] or now - last < 0.5:
+            return
+        sequence += 1
+        last = now
+        # Each FFmpeg step has its own clock. The message carries that step's reading, and
+        # the notification sequence stays increasing across steps without a fake overall total.
+        _write(out, {"jsonrpc": "2.0", "method": "notifications/progress",
+                     "params": {"progressToken": token, "progress": sequence, "message": message}})
+    return report
 
 
 def _call_worker(out: Any) -> None:
@@ -333,7 +367,9 @@ def _call_worker(out: Any) -> None:
         resp = None
         try:
             if not entry["cancelled"]:
-                resp = _respond(req, on_start=started)
+                report = _progress_reporter(req, entry, out)
+                options = {"on_progress": report} if report is not None else {}
+                resp = _respond(req, on_start=started, **options)
             # a call cancelled while it ran: the next one starts only once the stop is done (on
             # Windows the tree kill may still be ending the tool's ffmpeg after the tool exited)
             with _CALLS_LOCK:
@@ -358,7 +394,12 @@ def version() -> str:
 
 def main() -> int:
     if "--list" in sys.argv:
-        for t in tool_list():
+        try:
+            tools = tool_list()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for t in tools:
             print(f"{t['name']:10s} {t['description']}")
         return 0
     if "--call" in sys.argv:  # debugging helper: --call NAME '{"input": "..."}'
