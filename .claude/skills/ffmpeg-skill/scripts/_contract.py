@@ -432,7 +432,7 @@ ERROR_REASONS = {
     "step_writes_without_out": "kind input: batch.py: a recipe step names no {out} (and no -o of its own) but its --json document reports an output file, its own default output, which the next step does not read and the batch does not deliver; the batch stops at that item (later items: skipped recipe_refused). Under --dry-run nothing is written; a real run has written that one file and leaves it. details: {step, tool, file, written, files, written_files, not_started}",
     "disk_full": "kind ffmpeg: ffmpeg reported \"No space left on device\" while writing; the hint says to free space or write elsewhere; details: {}",
     "filter_missing": "kind ffmpeg: this ffmpeg build lacks a filter the command names: for a command run() is given (not a run_analysis() measurement pass), refused before ffmpeg runs, dry runs included, when the build's filter list was read and lacks it, else ffmpeg's own \"No such filter\"; render.py and waveform.py with a title or captions run their own dry run first and are refused with its document (the stage's message, details and stage) before the first stage encodes; details: {name}; the hint points at doctor",
-    "input_incomplete": "kind ffmpeg: the input has no index (\"moov atom not found\"): a recording cut off or a copy not finished; --repair cannot rebuild it; details: {}",
+    "input_incomplete": "kind ffmpeg: the input has no index (\"moov atom not found\") or the demuxer reports premature EOF/partial file, even with exit 0; missing media cannot be rebuilt; details: {}",
     "input_unreadable": "kind ffmpeg: ffmpeg could not read the input as media (\"Invalid data found when processing input\"); details: {}",
     "ffmpeg_unsupported": "kind missing_tool: the ffmpeg/ffprobe on PATH reports a version older than 6.1, which 3.0.0 no longer supports (5.x was deprecated in 2.14.0); details: {version, required}",
     "read_only_plan_refused": "--plan in a process run with FFMPEG_SKILL_READ_ONLY=1 (mcp/server.py sets it for the tools annotated readOnlyHint: probe, check, cropdetect), which must write no file; details: {plan}",
@@ -560,6 +560,7 @@ DIAGNOSTIC_CODES = {
     "flash_pass_failed": ("warnings", "check.py --content: the flash pass failed, so the flashes row is not measured (WARN, could not measure); the other rows stand"),
     "repair_incomplete": ("warnings", "export.py --repair: decode errors remain after the remux (a damaged frame needs a re-encode); {timestamp_warnings, decode_errors}"),
     "legalize_residual": ("warnings", "color.py --legalize: samples of the encoded file are still outside the legal range after the clamp (the encoder's error around clamped areas); the shares are in legalize.output"),
+    "picture_small_in_frame": ("warnings", "export.py, fit.py (--fit pad with a solid colour): the picture fills less than half of the frame it was padded into, as a 9:16 clip in a 16:9 preset does (32%); the file is the frame asked for; {fraction, source, frame}"),
     "size_over_limit": ("warnings", "export.py --max-mb: the written file is over the size asked for (the encoder overshot its bitrate); {size, limit}"),
     "loudness_outside_spec": ("warnings", "export.py: the written file's loudness is outside the platform's spec (normalized: after --normalize too); {platform, lufs, tp, normalized}"),
     "smart_fallback": ("fallbacks", "cut.py --smart could not make or verify the smart cut, so the whole cut was re-encoded as --accurate would (smart.reason says why); {reason_code}"),
@@ -630,13 +631,13 @@ FONT_USED_SCHEMA = {
                    "recorded. how: font_file (the "
                    "caller's file), script (picked to cover the text's script), resolved (the asked family resolved to a file by "
                    "fc-match or the Windows Fonts folder; for libass, the file fontconfig picks for the family), by_name (no file "
-                   "resolved: ffmpeg/libass look the family up themselves, file null), fonts_dir (caption.py: --fonts-dir holds the asked "
-                   "family, read by fc-scan; file names its face in exactly the asked style (upright, weight 400, or 700 with "
+                   "resolved: ffmpeg/libass look the family up themselves, file null), fonts_dir (caption.py: --fonts-dir is searched for the asked "
+                   "family, read by fc-scan; only faces with outline true are candidates; file names its face in exactly the asked style (upright, weight 400, or 700 with "
                    "--bold), or the face whose full or PostScript name was asked, which libass takes first (an installed copy "
                    "that ties is the same family and style); file null, with a note, when the folder holds the family only in "
                    "other styles (libass picks among those and the installed faces; not measured) or could not be read; a "
-                   "folder with no face of that name is reported as a run without --fonts-dir reports it, how resolved or "
-                   "by_name, substituted only when the file resolved is another family, fonts_dir still named), ass_styles (caption.py --ass: the file's own styles name the fonts). substituted: the "
+                   "literal miss also reports file null, how fonts_dir and the family as asked: libass may select a directory face through a "
+                   "fontconfig alias, so the face is not established (substituted false is not a measured absence of substitution)), ass_styles (caption.py --ass: the file's own styles name the fonts). substituted: the "
                    "file is not the asked family (also a diagnostics.fallbacks entry, font_substituted). overlay.py: with --text; "
                    "grid.py: with --label auto",
 }
