@@ -71,6 +71,15 @@ def pad_filters(out_w: int, out_h: int, fill: str, color: str, blur: int, darken
             + (pad + color if meta is None else drawn_chain(pad + color, meta, [color], pad + "black", tag="pad")))
 
 
+def warn_mostly_cropped(video: Optional[Dict[str, Any]], out_w: int, out_h: int) -> None:
+    """A crop to another shape that keeps less than half of the picture says so (#688), as a pad
+    that leaves the picture small does (picture_small_in_frame): a 1920x1080 clip cropped to 9:16
+    keeps the centre 32% of it. A warning only: a vertical crop of landscape footage is the usual
+    way to make a Short, and the file is what was asked for."""
+    if all(d := display_size(video)) and out_w and out_h and (part := min(out_w * d[1] / (out_h * d[0]), out_h * d[0] / (out_w * d[1]))) < 0.5:
+        warn(f"the crop keeps {part:.0%} of the picture: the source is {d[0]}x{d[1]} and the frame {out_w}x{out_h}, another shape. --fit pad keeps all of it with bars, --fit blur over a blurred copy", "picture_mostly_cropped", fraction=round(part, 3), source=f"{d[0]}x{d[1]}", frame=f"{out_w}x{out_h}")
+
+
 def add_pad_fill_args(parser: "argparse.ArgumentParser") -> None:
     parser.add_argument("--pad-fill", choices=["color", "blur"], default="color",
                         help="what fills the letterbox/pillarbox bars under --fit pad: a solid --pad-color (default) or a blurred, scaled-up copy of the frame")
@@ -103,6 +112,13 @@ def aspect_ratio(value: Any) -> Optional[Fraction]:
 def _even(n: float) -> int:
     v = int(round(n))
     return v if v % 2 == 0 else v + 1
+
+
+# A frame larger than the picture is enlarged with Lanczos in place of swscale's default bicubic:
+# fewer soft edges where a 720p clip is delivered at 1080x1920. Nothing is added when the frame is
+# the picture's size or smaller, so those commands are the ones they were.
+def enlarge_args(meta: Optional[Dict[str, Any]], w: Optional[int], h: Optional[int]) -> List[str]:
+    return ["-sws_flags", "lanczos"] if w and h and all(d := display_size((meta or {}).get("video"))) and (w > d[0] or h > d[1]) else []
 
 
 def frame_size(ratio: Optional[Fraction], width: Optional[int], height: Optional[int],
@@ -498,6 +514,13 @@ def frame_durations(meta: Optional[Dict[str, Any]], rate: float) -> str:
     return f"fps={rate:.6f}"
 
 
+# a time written in milliseconds is the frame it reads back to (#653): the nearest frame when that
+# is within half a millisecond either way, never one before the first; any other time is itself.
+# For a position the caller names (a cut point, --at, a segment bound), not for a length
+def on_frame(t: float, v0: float, rate: float) -> float:
+    return g if rate and (n := round((t - v0) * rate)) >= 0 and abs((g := v0 + n / rate) - t) <= 0.0005 else t
+
+
 def grid_at_or_after(t: float, v0: float, rate: float) -> float:
     """The time of the first frame at or after `t` on a constant-rate grid starting at `v0`."""
     if not rate:
@@ -702,7 +725,11 @@ def cfr_args(meta: Optional[Dict[str, Any]], fps: Optional[float] = None) -> Lis
         return []
     rate = fps or v.get("fps") or 30.0
     rate = round(rate) if abs(rate - round(rate)) < 0.02 else rate
-    return ["-fps_mode", "cfr", "-r", f"{rate:g}"]
+    # a rate the caller asked for relabels the start timecode, counted at the new rate (#470:
+    # proxy/denoise/crop/redact/sphere/straighten --fps 50 kept 01:00:00:12, a 25 fps label)
+    from _common.timeline import output_timecode_args
+    relabel = output_timecode_args(meta, 0.0, rate) if fps and v.get("fps") and abs(float(fps) - float(v["fps"])) > 0.01 else []
+    return ["-fps_mode", "cfr", "-r", f"{rate:g}"] + relabel
 
 
 def cfr_filter(meta: Optional[Dict[str, Any]], fps: Optional[float] = None, seek: float = 0.0) -> str:
@@ -729,10 +756,11 @@ def cfr_filter(meta: Optional[Dict[str, Any]], fps: Optional[float] = None, seek
     args = cfr_args(meta, fps)
     if not args:
         return ""
+    rate = args[args.index("-r") + 1]
     if seek > 0:
-        return (f"setpts=PTS-{seek:.6f}/TB,fps={args[-1]}:start_time=0,"
+        return (f"setpts=PTS-{seek:.6f}/TB,fps={rate}:start_time=0,"
                 f"settb=AVTB,setpts=PTS+{seek:.6f}/TB")
-    return f"fps={args[-1]}"
+    return f"fps={rate}"
 
 
 def with_cfr(chain: str, meta: Optional[Dict[str, Any]], fps: Optional[float] = None) -> str:

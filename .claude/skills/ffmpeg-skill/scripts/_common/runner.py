@@ -370,7 +370,7 @@ class Context:
     __slots__ = ("parser", "dry_run", "json", "json_brief", "progress", "fast", "duration_hint", "commands", "timeout", "overwrite", "written", "preexisting", "checked", "plan", "plan_written", "plan_inputs", "codec", "alpha_line",
                  "hw", "hw_source", "hw_notes", "hw_swaps", "hw_fallback", "hw_env_ignored", "hw_stages", "hw_auto",
                  "notes", "warnings", "fallbacks", "skipped", "audit_log", "stage_verification", "first_input", "audio_inputs", "video_inputs",
-                 "source_timecode", "smpte_hint", "delivered", "expected_timecode", "watched", "temp_dirs", "side_deliveries",
+                 "source_timecode", "smpte_hint", "delivered", "expected_timecode", "time_mapped", "watched", "temp_dirs", "side_deliveries",
                  "_stream_copy_outputs", "_encoded_media", "measured_plan_inputs", "plan_generated_inputs",
                  "sequence_frames_sha256")
 
@@ -384,6 +384,7 @@ class Context:
         self.video_inputs = set()  # real paths of the inputs probed that have a picture: with two or more, which one the output shows is the tool's choice (sync --trim-second, a join)
         self.source_timecode = None  # (start timecode, duration) of the first input probed that carries one (time_arg's SMPTE hint)
         self.expected_timecode = None  # the start timecode a tool that moved the picture's start wrote (timeline.output_timecode_args; "" for none): source_carry compares it
+        self.time_mapped = None  # how a tool that changed the output's length moved its chapters (declare_time_map)
         self.smpte_hint = None    # what die() says when an hh:mm:ss:ff flag read past the end looks like a source timecode (#411)
         self.delivered: List[str] = []  # deliverables written before a later step (export --normalize, render's chapters/check): a stop then keeps them (#415)
         self.watched: Dict[str, Any] = {}  # a path a running child writes (render's export stage): its owned_identity() before the child started (watch_destination)
@@ -3025,7 +3026,10 @@ def run_tool(argv: Sequence[str], *, per_call: Optional[float] = None,
     the client cancels). Tagged progress is streamed to `on_progress` or relayed to the MCP
     process through a parent tool such as render.py."""
     limit = child_limit(per_call)
-    child = subprocess.Popen([sys.executable] + list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
+    # its own stdin, never ours: under the MCP server ours is the client's JSON-RPC pipe, and on
+    # Windows a Python child that inherited it did not finish exiting while the client held it open,
+    # so the answer to tools/call was written only when the client hung up (#664)
+    child = subprocess.Popen([sys.executable] + list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env)
     _watch(child, [])  # a sibling script removes its own partial output; there is none of ours to clean
     if on_start is not None:
         on_start(child)
@@ -3274,6 +3278,8 @@ def run_keeping_subtitles(cmd: List[str], output: str, relabel_timecode: bool = 
     `relabel_timecode`: the command writes its own start timecode (timeline.output_timecode_args),
     so a source's tmcd data track is not copied -- its label, at the source's rate, would win over
     the new one; the MOV/MP4 muxer builds the track again from the label."""
+    # a command that writes its own label (a -metadata:s:v:0 timecode=...) relabels whoever built it
+    relabel_timecode = relabel_timecode or any(a.startswith("timecode=") for a in cmd)
     skip_tmcd = ["-map", "-0:d:m:timecode"] if relabel_timecode else []
     src = next(iter(shape_of(cmd).inputs), None)
     sub_args = ["-map", "0:s?"] + carried_stream_maps(src, output, chapters=False) + subtitle_codec_args(src, output)
@@ -3336,7 +3342,8 @@ def _die_with_parent() -> None:
 
 def child_kwargs() -> Dict[str, Any]:
     """Extra Popen arguments for an ffmpeg/ffprobe child (see _die_with_parent)."""
-    return {"preexec_fn": _die_with_parent} if sys.platform.startswith("linux") else {}
+    # no child reads this process's stdin: under the MCP server that is the client's JSON-RPC pipe (#664)
+    return dict({"preexec_fn": _die_with_parent} if sys.platform.startswith("linux") else {}, stdin=subprocess.DEVNULL)
 
 
 def _run_captured(cmd: List[str]) -> subprocess.CompletedProcess:
@@ -3651,6 +3658,50 @@ def _drawtext_tmpdir(create: bool = True) -> str:
     _DRAWTEXT_TMPDIR = tempfile.mkdtemp(prefix="ffmpeg-skill-text-")
     atexit.register(shutil.rmtree, _DRAWTEXT_TMPDIR, True)
     return _DRAWTEXT_TMPDIR
+
+
+def declare_time_map(how: str) -> None:
+    """A tool that changes the output's length says how its time-bearing items follow: "mapped"
+    (with_mapped_chapters did it) or why FFmpeg's own handling is right ("input seek": FFmpeg
+    moves chapters with an input -ss; "clipped": the output keeps the source's clock and only ends
+    earlier or later). Without it, emit's source_carry says chapters_not_retimed whenever the
+    length changed (the guard for the time class, docs/defect-guards.json)."""
+    STATE.time_mapped = how
+
+
+def segments_map(segments: "Sequence[Tuple[float, float]]") -> "Callable[[float], float]":
+    """The time map of a join of `segments` of one source (cut --segments/--remove, silence): a
+    source time inside a kept range lands at that range's place in the output; a removed time
+    collapses onto the join, so a chapter wholly inside a removed range is left with no length."""
+    return lambda t: sum(min(max(t - s, 0.0), e - s) for s, e in segments)
+
+
+def with_mapped_chapters(cmd: "List[str]", meta: "Optional[Dict[str, Any]]", to_output: "Callable[[float], float]",
+                         length: "Optional[float]") -> "List[str]":
+    """`cmd` (without its output path) with the source's chapters moved onto the output's clock:
+    FFmpeg copies them as they were, so pad --start, a speed change, a reverse, a hold or a speed
+    ramp left them where the source had them (#470). `to_output` maps a source time to the
+    output's; each chapter is clipped to [0, length] and one left with no length is dropped. The
+    chapters go in as an ffmetadata input of their own, written into the run's private temp
+    directory when the command runs (flush_drawtext_textfiles), so a dry run writes nothing."""
+    chapters = (meta or {}).get("chapters") or []
+    declare_time_map("mapped")
+    if not chapters or "-map_chapters" in cmd:
+        return cmd
+    mapped = []
+    for c in chapters:
+        a, b = sorted((to_output(float(c["start"] or 0.0)), to_output(float(c["end"] or 0.0))))
+        a, b = max(a, 0.0), min(b, length) if length else b
+        if b - a >= 0.0005:
+            mapped.append((a, b, c.get("title") or ""))
+    esc = lambda v: "".join("\\" + ch if ch in "=;#\\\n" else ch for ch in v)
+    body = ";FFMETADATA1\n" + "".join(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={round(a * 1000)}\nEND={round(b * 1000)}\ntitle={esc(t)}\n"
+                                      for a, b, t in sorted(mapped))
+    path = os.path.join(_drawtext_tmpdir(create=not STATE.dry_run), f"chapters-{os.getpid()}-{len(_DRAWTEXT_PENDING)}.ffmeta")
+    _DRAWTEXT_PENDING[path] = body
+    last = max(i for i, a in enumerate(cmd) if a == "-i")
+    n = sum(1 for a in cmd if a == "-i")
+    return cmd[:last + 2] + ["-f", "ffmetadata", "-i", path] + cmd[last + 2:] + ["-map_chapters", str(n)]
 
 
 def flush_drawtext_textfiles(cmd: "Sequence[str]") -> "List[str]":

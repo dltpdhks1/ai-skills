@@ -227,6 +227,16 @@ def source_carry(output: Optional[str], ctx: "Context", extra: Dict[str, Any]) -
         (kept if out.get(item, 0) >= src[item] else dropped).append(item)
     if not kept and not dropped:
         return None
+    # The class guard for time (docs/defect-guards.json): an output of another length whose
+    # chapters were carried by a tool that declared no time map (runner.with_mapped_chapters, or
+    # runner.declare_time_map where FFmpeg's own handling is right) kept them at the source's
+    # times. Seven ledger entries were one tool each moving time and leaving something behind
+    # (#470, #653, #696); this is said for every tool, including one written after this line.
+    if ("chapters" in kept and not getattr(STATE, "time_mapped", None)
+            and abs((out.get("duration") or 0.0) - (src.get("duration") or 0.0)) > 0.1):
+        warn(f"the output is {out.get('duration') or 0:.2f} s against the source's {src.get('duration') or 0:.2f} s, and its chapters "
+             f"were carried at the source's times: the tool moved the picture in time without moving them",
+             "chapters_not_retimed", source_chapters=src.get("chapter_times"), output_chapters=out.get("chapter_times"))
     said = set()
     if extra.get("dropped_non_av_streams") or any(w.get("code") == "non_av_streams_dropped" for w in ctx.fallbacks):
         said.add("subtitles")  # the tool's own field already says the track went
@@ -916,6 +926,13 @@ def emit(output: Optional[str], *, ctx: "Optional[Context]" = None,
                 extra[key] = None
         doc: Dict[str, Any] = {"status": "completed", "output": output, "dry_run": ctx.dry_run, "commands": list(ctx.commands)}
         probed = bool(meta and not meta.get("dry_run"))
+        if probed and meta.get("duration") is not None:
+            # the first thing a caller reads: what the file is, and where its length misses what
+            # was asked (a 120 ms miss of a stream copy sat in duration_error_ms under verified: true)
+            v, got, want = meta.get("video") or {}, float(meta["duration"]), extra.get("expected_duration")
+            miss = f" (ASKED {want:.3f} s: {abs(got - want):.3f} s {'longer' if got > want else 'shorter'})" if isinstance(want, (int, float)) and abs(got - want) > 0.04 else ""
+            shape = f", {v.get('width')}x{v.get('height')}, {v.get('fps')} fps" if v else ""
+            doc = {"status": "completed", "wrote": f"{got:.3f} s{miss}{shape}, " + ("picture and sound" if v and meta.get("audio") else "picture only" if v else "sound only"), **doc}
         if probed:
             doc["probe"] = meta
         identity = file_identity(output) if output and not ctx.dry_run else None

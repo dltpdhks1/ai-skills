@@ -448,7 +448,11 @@ ERROR_REASONS = {
     "input_permission_denied": "an input exists or may exist but the user this runs as may not read it, or may not search a directory on the way to it (EACCES, as opposed to a path that is not there, which stays \"input not found\" with no reason); dry runs included; details: {path}",
     "media_path_not_a_file": "an input exists but is not a regular file (a FIFO or a device), which ffmpeg would block on or read as a stream; details: {path}",
     "join_copy_mismatch": "join.py --copy: a clip's streams do not match the first clip's, it hides pre-roll frames with an edit list, or its picture and sound end more than 50 ms apart, or (AAC) a copy join would put the sound more than 50 ms behind or ahead of the picture at some clip (each later clip's priming played at its seam plus the difference between each clip's sound and picture; details also aac_drift_ms, negative when ahead, and tolerance_ms); details: {clips: [{index?, path, differs}]}",
-    "fit_method_required": "fit.py --duration would retime the clip beyond 1.15x in either direction without a method or an explicit slow-motion filter; details: {factor, threshold, source_duration, target_duration}",
+    "audio_cut_transition": "join.py --audio-lead/--audio-lag with a transition: the J-cut or L-cut is a plain cut (--transition none)",
+    "audio_cut_copy": "join.py --audio-lead/--audio-lag with --copy: picture and sound are cut at different times, which a stream copy cannot do",
+    "audio_cut_both_flags": "join.py --audio-lead and --audio-lag together: a J-cut and an L-cut are two different cuts",
+    "audio_cut_too_long": "join.py --audio-lead/--audio-lag under one frame of the output rate, or not shorter than a clip it takes from",
+    "fit_method_required":"fit.py --duration would retime the clip beyond 1.15x in either direction without a method or an explicit slow-motion filter; details: {factor, threshold, source_duration, target_duration}",
     "output_path_taken": "two files one run writes (a side file and the output, or two side files) resolve to the same path, so the second would replace the first; details: {output, other}",
     "output_looks_like_option": "the output starts with '-' (other than '-' for stdout), which ffmpeg would read as an option; ./name writes a file of that name; details: {output}",
     "media_path_is_url": "an input or output has a protocol prefix (tcp:, http://, file:, ...) that ffmpeg would open as a URL; the skill reads and writes local files only; details: {path, scheme}",
@@ -561,6 +565,8 @@ DIAGNOSTIC_CODES = {
     "repair_incomplete": ("warnings", "export.py --repair: decode errors remain after the remux (a damaged frame needs a re-encode); {timestamp_warnings, decode_errors}"),
     "legalize_residual": ("warnings", "color.py --legalize: samples of the encoded file are still outside the legal range after the clamp (the encoder's error around clamped areas); the shares are in legalize.output"),
     "picture_small_in_frame": ("warnings", "export.py, fit.py (--fit pad with a solid colour): the picture fills less than half of the frame it was padded into, as a 9:16 clip in a 16:9 preset does (32%); the file is the frame asked for; {fraction, source, frame}"),
+    "picture_mostly_cropped": ("warnings", "export.py, fit.py, join.py (--fit crop): the crop keeps less than half of the picture, as a 16:9 clip cropped to 9:16 keeps 32%; {fraction, source, frame}. The file is what was asked; --fit pad or blur keeps all of it (#688)"),
+    "chapters_not_retimed": ("warnings", "any tool: the output's length differs from the source's by more than 0.1 s and its chapters were carried at the source's times by a tool that declared no time map; {source_chapters, output_chapters}. The guard of the time class (docs/defect-guards.json): a tool that moves the picture in time maps its chapters (runner.with_mapped_chapters) or says why FFmpeg's own handling is right (runner.declare_time_map)"),
     "size_over_limit": ("warnings", "export.py --max-mb: the written file is over the size asked for (the encoder overshot its bitrate); {size, limit}"),
     "loudness_outside_spec": ("warnings", "export.py: the written file's loudness is outside the platform's spec (normalized: after --normalize too); {platform, lufs, tp, normalized}"),
     "smart_fallback": ("fallbacks", "cut.py --smart could not make or verify the smart cut, so the whole cut was re-encoded as --accurate would (smart.reason says why); {reason_code}"),
@@ -637,8 +643,8 @@ FONT_USED_SCHEMA = {
                    "that ties is the same family and style); file null, with a note, when the folder holds the family only in "
                    "other styles (libass picks among those and the installed faces; not measured) or could not be read; a "
                    "literal miss also reports file null, how fonts_dir and the family as asked: libass may select a directory face through a "
-                   "fontconfig alias, so the face is not established (substituted false is not a measured absence of substitution)), ass_styles (caption.py --ass: the file's own styles name the fonts). substituted: the "
-                   "file is not the asked family (also a diagnostics.fallbacks entry, font_substituted). overlay.py: with --text; "
+                   "fontconfig alias, so the face is not established), ass_styles (caption.py --ass: the file's own styles name the fonts). substituted: true when the "
+                   "file is not the asked family (also a diagnostics.fallbacks entry, font_substituted), false when it is, and null wherever file is null: no face was established, so nothing was measured. overlay.py: with --text; "
                    "grid.py: with --label auto",
 }
 
@@ -732,6 +738,7 @@ def output_schema(name: str, meta: Dict[str, Any], hw: bool = False) -> Dict[str
                                "levels": {"type": "object", "description": "--analyze only, on an input with a video stream: picture levels sampled at 2 fps over the first 20 s, on an 8-bit scale inferred from the values measured (a 10-bit or deeper picture whose luma never passes code 255 is read as 8-bit and left unscaled) {scale, y_min, y_max, y_avg, y_low_p5, y_high_p95, saturation_avg, looks_like_log, note}; {error} when no frame was analysed. Measured under --dry-run too"}},
                 "additionalProperties": True}
     base = {"status": {"enum": ["completed"]}, "output": {"type": ["string", "null"], "description": "path written, or null"},
+            "wrote": {"type": "string", "description": "one line about the file written, first in the document: its length, `(ASKED N s: M s longer|shorter)` when the length misses expected_duration by more than 40 ms, the frame and rate, and whether it holds picture and sound; absent under --dry-run and for an output that is not media"},
             "dry_run": {"type": "boolean"}, "commands": {"type": "array", "items": {"type": "string"}, "description": "the ffmpeg command lines this run planned or ran to write its output (render.py and waveform.py: their stages' too), shell-quoted; a line that names a file the tool wrote for the run and removed when it exited (such as a concat list, an ffmetadata file, a drawtext text file, a two-pass log or a stage's intermediate) cannot be run again as printed; a measurement pass is listed only where the tool records it (e.g. loudness.py pass 1, check.py, stabilize.py pass 1), and batch.py lists none of its steps' (each results row's step documents carry their own)"},
             "probe": {"type": "object", "description": "probe of the output when a file was written"},
             "output_identity": {"type": "object", "description": "2.24: {size, mtime_ns} of the file this run wrote, absent under --dry-run; pass it to check.py --expect-identity SIZE:MTIME_NS so the check grades this file and not whatever later sits at the path"},

@@ -1262,7 +1262,7 @@ def main() -> int:
     sty.add_argument("--outline-color", default=None, help="outline colour RRGGBB")
     sty.add_argument("--outline", type=float, default=None, help="outline width (default 2)")
     sty.add_argument("--shadow", type=float, default=0.0, help="shadow depth (default 0)")
-    sty.add_argument("--bold", action="store_true")
+    sty.add_argument("--bold", action="store_true", help="bold caption text")
     sty.add_argument("--position", choices=sorted(ALIGN), default=None, help="on-screen placement (default bottom)")
     sty.add_argument("--margin", type=int, default=None, help="vertical margin from the edge in ASS units (default 30, or the --platform safe zone)")
     sty.add_argument("--platform", choices=PLATFORM_CHOICES, default=None,
@@ -1315,7 +1315,7 @@ def main() -> int:
     anim.add_argument("--write-ass", help="where to save the generated ASS (default: next to the output)")
     enc = ap.add_argument_group("encoding")
     enc.set_defaults(crf=18)  # --quality's default (the --crf alias was removed in 2.0)
-    enc.add_argument("--preset", default="medium", choices=X264_PRESETS)
+    enc.add_argument("--preset", default="medium", choices=X264_PRESETS, help="x264 preset")
     add_common(ap)
     args = ap.parse_args(_glue_negative_offset(sys.argv[1:]))
     apply_common(args)
@@ -1966,7 +1966,7 @@ def main() -> int:
     if args.ass:
         # the caller's own ASS names its fonts in its styles; this run does not choose them
         font_used = {"asked": None, "file": None, "family": None, "how": "ass_styles",
-                     "fonts_dir": args.fonts_dir or (os.path.dirname(font_file) if font_file else None), "substituted": False}
+                     "fonts_dir": args.fonts_dir or (os.path.dirname(font_file) if font_file else None), "substituted": None}
     elif font_file or not args.fonts_dir:
         # the family libass is given is the sanitised one (ass_font_name): that is what it resolves
         font_used = record_font_choice(font_choice(ass_font_name(args.font), script_file=font_file, script_family=font_family,
@@ -1985,7 +1985,7 @@ def main() -> int:
                  f"({'bold' if args.bold else 'regular'}, upright); libass picks among those and the installed "
                  "faces of the family, so font_used names no file (not measured)")
         font_used = {"asked": asked, "file": face, "family": asked, "how": "fonts_dir",
-                     "fonts_dir": args.fonts_dir, "substituted": False}
+                     "fonts_dir": args.fonts_dir, "substituted": False if face else None}  # no file, no measurement (#663)
     if font_file:
         args.font = font_family or args.font
         if not args.fonts_dir:
